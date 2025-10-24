@@ -1,0 +1,75 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.a
+*.so
+*.dylib
+
+# Executables
+name_server
+storage_server
+client
+test_protocol
+
+# Log files
+*.log
+
+# Storage directories
+ss_storage/
+data/
+storage/
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Core dumps
+core
+core.*
+
+# Debug files
+*.dSYM/
+*.pdb
+
+# System files
+.directory
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Testing
+test_results/
+coverage/
+*.gcda
+*.gcno
+*.gcov
+
+# Documentation builds
+docs/_build/
+docs/.doctrees/
+
+# Package files
+*.tar.gz
+*.zip
+*.7z
+
+# Backup files
+*.backup
+*-backup
