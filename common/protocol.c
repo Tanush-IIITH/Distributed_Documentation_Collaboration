@@ -43,6 +43,7 @@ const char* protocol_get_error_message(int error_code) {
 // MESSAGE PARSING AND BUILDING
 // ============================================================================
 
+// Parse a protocol message from a raw string
 int protocol_parse_message(const char *raw, ProtocolMessage *msg) {
     if (!raw || !msg) {
         return -1;
@@ -183,6 +184,7 @@ int protocol_send_message(int sockfd, const char *message) {
     return total_sent;
 }
 
+//receive message from socket until terminator is found
 char* protocol_receive_message(int sockfd) {
     if (sockfd < 0) {
         return NULL;

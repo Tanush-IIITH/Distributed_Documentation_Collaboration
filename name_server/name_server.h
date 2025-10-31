@@ -3,6 +3,7 @@
 
 #include "../common/protocol.h"
 #include "../common/utils.h"
+#include <pthread.h>
 
 // Name Server configuration
 #define NS_MAX_STORAGE_SERVERS 100
@@ -42,14 +43,19 @@ typedef struct {
 
 // Name Server structure
 typedef struct {
-    int port;
-    int sockfd;
-    StorageServerInfo storage_servers[NS_MAX_STORAGE_SERVERS];
-    int ss_count;
-    ClientInfo clients[NS_MAX_CLIENTS];
-    int client_count;
-    FileMetadata files[NS_MAX_FILES];
-    int file_count;
+    int port; // Port number the Name Server listens on
+    int sockfd; // Socket file descriptor for the Name Server
+
+    StorageServerInfo storage_servers[NS_MAX_STORAGE_SERVERS]; // Array to store information about registered storage servers
+    int ss_count; // Count of currently registered storage servers
+
+    ClientInfo clients[NS_MAX_CLIENTS]; // Array to store information about connected clients
+    int client_count; // Count of currently connected clients
+
+    FileMetadata files[NS_MAX_FILES]; // Array to store metadata of files managed by the Name Server
+    int file_count; // Count of files currently managed by the Name Server
+
+    pthread_mutex_t state_lock; // Mutex to protect shared state (e.g., storage_servers, clients, files)
 } NameServer;
 
 /**
