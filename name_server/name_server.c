@@ -274,7 +274,38 @@ static void *connection_thread(void *arg) {
         log_message(LOG_INFO, "NS", "Connection with %s:%d finished without persistent session.", ctx->peer_ip, ctx->peer_port);
     }
 
-    // TODO: remove connection metadata from NameServer state before closing the socket
+    pthread_mutex_lock(&ns->state_lock);
+    if (ctx->is_client && ctx->username[0]) {
+        for (int i = 0; i < ns->client_count; i++) {
+            ClientInfo *client = &ns->clients[i];
+            if (client->is_connected && strcmp(client->username, ctx->username) == 0) {
+                int last_index = ns->client_count - 1;
+                if (i != last_index) {
+                    ns->clients[i] = ns->clients[last_index];
+                }
+                memset(&ns->clients[last_index], 0, sizeof(ClientInfo));
+                ns->client_count--;
+                log_message(LOG_INFO, "NS", "Client %s deregistered", ctx->username);
+                break;
+            }
+        }
+    } else if (ctx->is_storage_server) {
+        for (int i = 0; i < ns->ss_count; i++) {
+            StorageServerInfo *ss = &ns->storage_servers[i];
+            if (ss->sockfd == ctx->conn_fd) {
+                int last_index = ns->ss_count - 1;
+                if (i != last_index) {
+                    ns->storage_servers[i] = ns->storage_servers[last_index];
+                }
+                memset(&ns->storage_servers[last_index], 0, sizeof(StorageServerInfo));
+                ns->ss_count--;
+                log_message(LOG_INFO, "NS", "Storage server %s:%d deregistered", ctx->peer_ip, ctx->peer_port);
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&ns->state_lock);
+
     close_connection(ctx);
     return NULL;
 }
