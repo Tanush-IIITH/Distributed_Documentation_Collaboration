@@ -379,12 +379,29 @@ int ns_register_storage_server(NameServer *ns, const char *ns_ip, int ns_port,
         log_message(LOG_ERROR, "NS", "Maximum storage servers reached");
         return -1;
     }
-    
-    // TODO: Implement SS registration
-    // 1. Store SS information
-    // 2. Send OK response
-    // 3. Receive file list
-    
+
+    for (int i = 0; i < ns->ss_count; i++) {
+        StorageServerInfo *info = &ns->storage_servers[i];
+        if (info->is_alive && strcmp(info->ns_ip, ns_ip) == 0 && info->ns_port == ns_port) {
+            log_message(LOG_WARNING, "NS", "Storage server %s:%d already registered", ns_ip, ns_port);
+            return -1;
+        }
+    }
+
+    StorageServerInfo *ss = &ns->storage_servers[ns->ss_count];
+    memset(ss, 0, sizeof(StorageServerInfo));
+    strncpy(ss->ns_ip, ns_ip, sizeof(ss->ns_ip) - 1);
+    ss->ns_ip[sizeof(ss->ns_ip) - 1] = '\0';
+    ss->ns_port = ns_port;
+    strncpy(ss->client_ip, client_ip, sizeof(ss->client_ip) - 1);
+    ss->client_ip[sizeof(ss->client_ip) - 1] = '\0';
+    ss->client_port = client_port;
+    ss->sockfd = sockfd;
+    ss->is_alive = 1;
+    ss->last_heartbeat = get_current_time();
+
+    ns->ss_count++;
+
     log_message(LOG_INFO, "NS", "Registered storage server: %s:%d", client_ip, client_port);
     return 0;
 }
@@ -398,13 +415,23 @@ int ns_register_client(NameServer *ns, const char *username, int sockfd) {
         log_message(LOG_ERROR, "NS", "Maximum clients reached");
         return -1;
     }
-    
-    // TODO: Implement client registration
-    // 1. Validate username
-    // 2. Check if already connected
-    // 3. Store client information
-    // 4. Send OK response
-    
+
+    for (int i = 0; i < ns->client_count; i++) {
+        if (ns->clients[i].is_connected && strcmp(ns->clients[i].username, username) == 0) {
+            log_message(LOG_WARNING, "NS", "Client %s already connected", username);
+            return -1;
+        }
+    }
+
+    ClientInfo *client = &ns->clients[ns->client_count];
+    memset(client, 0, sizeof(ClientInfo));
+    strncpy(client->username, username, sizeof(client->username) - 1);
+    client->username[sizeof(client->username) - 1] = '\0';
+    client->sockfd = sockfd;
+    client->is_connected = 1;
+
+    ns->client_count++;
+
     log_message(LOG_INFO, "NS", "Registered client: %s", username);
     return 0;
 }
