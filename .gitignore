@@ -6,12 +6,6 @@ bin/
 *.so
 *.dylib
 
-# Executables
-# name_server
-# storage_server
-# client
-# test_protocol
-
 # Log files
 *.log
 
