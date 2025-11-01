@@ -7,10 +7,10 @@ bin/
 *.dylib
 
 # Executables
-name_server
-storage_server
-client
-test_protocol
+# name_server
+# storage_server
+# client
+# test_protocol
 
 # Log files
 *.log
