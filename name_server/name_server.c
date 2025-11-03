@@ -8,7 +8,9 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <errno.h>
+#include <limits.h>
 
+// Initialize the Name Server
 int ns_init(NameServer *ns, int port) {
     if (!ns) {
         return -1;
@@ -20,6 +22,9 @@ int ns_init(NameServer *ns, int port) {
     ns->ss_count = 0;
     ns->client_count = 0;
     ns->file_count = 0;
+    memset(ns->file_index, 0, sizeof(ns->file_index));
+    memset(ns->file_cache, 0, sizeof(ns->file_cache));
+    ns->cache_tick = 0;
     if (pthread_mutex_init(&ns->state_lock, NULL) != 0) {
         log_message(LOG_ERROR, "NS", "Failed to initialize mutex: %s", strerror(errno));
         return -1;
@@ -29,6 +34,7 @@ int ns_init(NameServer *ns, int port) {
     return 0;
 }
 
+// Connection context structure - to hold per-connection state
 typedef struct {
     NameServer *ns;
     int conn_fd; //connection file descriptor
@@ -60,6 +66,175 @@ static void send_error_and_log(int fd, int code, const char *message, const char
     log_message(LOG_WARNING, "NS", "Sent error %d to %s:%d -> %s", code, peer_ip, peer_port, message);
 }
 
+/*
+    Explanation of Hash implementation
+    The hash function takes a string (filename) as input and produces a fixed-size integer (hash value) as output. 
+    This hash value is used to determine the index in the hash table (file index) where the corresponding file metadata will be stored. 
+    The goal of the hash function is to distribute the file entries uniformly across the hash table to minimize collisions and ensure efficient lookups.
+    In case of collisions (two filenames producing the same hash value), a linked list is used to store multiple entries in the same bucket.
+*/
+
+//hash function for filenames
+static unsigned long hash_filename(const char *str) {
+    unsigned long hash = 5381;
+    int c;
+    while (str && (c = *str++)) {
+        hash = ((hash << 5) + hash) + (unsigned long)c;
+    }
+    return hash;
+}
+
+//find file index node by filename
+static FileIndexNode *file_index_find(NameServer *ns, const char *filename) {
+    if (!ns || !filename) {
+        return NULL;
+    }
+
+    unsigned long bucket = hash_filename(filename) % FILE_INDEX_SIZE;
+    FileIndexNode *node = ns->file_index[bucket];
+    while (node) {
+        if (strcmp(node->filename, filename) == 0) {
+            return node;
+        }
+        node = node->next;
+    }
+    return NULL;
+}
+
+//insert file index node
+static int file_index_insert(NameServer *ns, const char *filename, int array_index) {
+    if (!ns || !filename || array_index < 0) {
+        return -1;
+    }
+
+    unsigned long bucket = hash_filename(filename) % FILE_INDEX_SIZE;
+    FileIndexNode *node = ns->file_index[bucket];
+    while (node) {
+        if (strcmp(node->filename, filename) == 0) {
+            node->file_array_index = array_index;
+            return 0;
+        }
+        node = node->next;
+    }
+
+    FileIndexNode *new_node = (FileIndexNode *)malloc(sizeof(FileIndexNode));
+    if (!new_node) {
+        return -1;
+    }
+
+    memset(new_node, 0, sizeof(FileIndexNode));
+    if (safe_strcpy(new_node->filename, filename, sizeof(new_node->filename)) != 0) {
+        free(new_node);
+        return -1;
+    }
+    new_node->file_array_index = array_index;
+    new_node->next = ns->file_index[bucket];
+    ns->file_index[bucket] = new_node;
+
+    return 0;
+}
+
+//find storage server by socket fd
+static StorageServerInfo *find_storage_server_by_sockfd(NameServer *ns, int sockfd) {
+    if (!ns) {
+        return NULL;
+    }
+    for (int i = 0; i < ns->ss_count; i++) {
+        if (ns->storage_servers[i].sockfd == sockfd) {
+            return &ns->storage_servers[i];
+        }
+    }
+    return NULL;
+}
+
+//LRU file cache lookup
+static int file_cache_lookup(NameServer *ns, const char *filename, FileMetadata *out_metadata, int *out_index) {
+    if (!ns || !filename || !out_metadata) {
+        return 0;
+    }
+
+    for (int i = 0; i < FILE_CACHE_SIZE; i++) {
+        FileCacheEntry *entry = &ns->file_cache[i];
+        if (!entry->valid) {
+            continue;
+        }
+
+        if (strcmp(entry->filename, filename) == 0) {
+            if (entry->file_array_index < 0 || entry->file_array_index >= ns->file_count) {
+                entry->valid = 0;
+                continue;
+            }
+
+            *out_metadata = ns->files[entry->file_array_index];
+            if (out_index) {
+                *out_index = entry->file_array_index;
+            }
+            entry->last_used = ++ns->cache_tick;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+//LRU file cache store
+static void file_cache_store(NameServer *ns, const char *filename, int array_index) {
+    if (!ns || !filename || array_index < 0 || array_index >= ns->file_count) {
+        return;
+    }
+
+    FileCacheEntry *target = NULL;
+
+    for (int i = 0; i < FILE_CACHE_SIZE; i++) {
+        FileCacheEntry *entry = &ns->file_cache[i];
+        if (entry->valid && strcmp(entry->filename, filename) == 0) {
+            target = entry;
+            break;
+        }
+    }
+
+    if (!target) {
+        for (int i = 0; i < FILE_CACHE_SIZE; i++) {
+            FileCacheEntry *entry = &ns->file_cache[i];
+            if (!entry->valid) {
+                target = entry;
+                break;
+            }
+        }
+    }
+
+    if (!target) {
+        unsigned long oldest = ULONG_MAX;
+        FileCacheEntry *oldest_entry = NULL;
+        for (int i = 0; i < FILE_CACHE_SIZE; i++) {
+            FileCacheEntry *entry = &ns->file_cache[i];
+            if (!entry->valid) {
+                oldest_entry = entry;
+                break;
+            }
+            if (entry->last_used < oldest) {
+                oldest = entry->last_used;
+                oldest_entry = entry;
+            }
+        }
+        target = oldest_entry;
+    }
+
+    if (!target) {
+        return;
+    }
+
+    if (safe_strcpy(target->filename, filename, sizeof(target->filename)) != 0) {
+        target->valid = 0;
+        return;
+    }
+
+    target->file_array_index = array_index;
+    target->last_used = ++ns->cache_tick;
+    target->valid = 1;
+}
+
+//client command processing loop
 static void run_client_loop(ConnectionContext *ctx) {
     if (!ctx || !ctx->ns) {
         return;
@@ -90,7 +265,47 @@ static void run_client_loop(ConnectionContext *ctx) {
         } else if (strcmp(command, MSG_CREATE) == 0) {
             // TODO: Handle CREATE
         } else if (strcmp(command, MSG_REQ_LOC) == 0) {
-            // TODO: Handle REQ_LOC
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in location request.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+                if (!validate_filename(filename)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename requested.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    FileMetadata file_copy;
+                    int found = 0;
+
+                    pthread_mutex_lock(&ns->state_lock);
+                    int file_index = -1;
+                    if (file_cache_lookup(ns, filename, &file_copy, &file_index)) {
+                        found = 1;
+                    } else {
+                        FileIndexNode *node = file_index_find(ns, filename);
+                        if (node && node->file_array_index >= 0 && node->file_array_index < ns->file_count) {
+                            file_index = node->file_array_index;
+                            file_copy = ns->files[file_index];
+                            file_cache_store(ns, filename, file_index);
+                            found = 1;
+                        }
+                    }
+                    pthread_mutex_unlock(&ns->state_lock);
+
+                    if (found) {
+                        char port_buf[16];
+                        snprintf(port_buf, sizeof(port_buf), "%d", file_copy.ss_port);
+                        const char *resp_fields[] = {RESP_OK_LOC, filename, file_copy.ss_ip, port_buf};
+                        char *resp = protocol_build_message(resp_fields, 4);
+                        if (resp) {
+                            protocol_send_message(ctx->conn_fd, resp);
+                            free(resp);
+                        } else {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build OK_LOC response.", ctx->peer_ip, ctx->peer_port);
+                        }
+                    } else {
+                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "Requested file not found.", ctx->peer_ip, ctx->peer_port);
+                    }
+                }
+            }
         } else {
             send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Unknown client command.", ctx->peer_ip, ctx->peer_port);
         }
@@ -107,6 +322,7 @@ static void run_ss_loop(ConnectionContext *ctx) {
 
     NameServer *ns = ctx->ns;
 
+    // Get storage server information
     while (1) {
         char *file_msg_raw = protocol_receive_message(ctx->conn_fd);
         if (!file_msg_raw) {
@@ -122,7 +338,74 @@ static void run_ss_loop(ConnectionContext *ctx) {
         }
 
         if (strcmp(file_msg.fields[0], MSG_SS_HAS_FILE) == 0) {
-            // TODO: Implement file registration from storage server
+            if (file_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in SS_HAS_FILE.", ctx->peer_ip, ctx->peer_port);
+                protocol_free_message(&file_msg);
+                free(file_msg_raw);
+                continue;
+            }
+
+            const char *filename = file_msg.fields[1];
+            if (!validate_filename(filename)) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename received from storage server.", ctx->peer_ip, ctx->peer_port);
+                protocol_free_message(&file_msg);
+                free(file_msg_raw);
+                continue;
+            }
+
+            pthread_mutex_lock(&ns->state_lock);
+            StorageServerInfo *ss = find_storage_server_by_sockfd(ns, ctx->conn_fd);
+            if (!ss) {
+                pthread_mutex_unlock(&ns->state_lock);
+                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unknown storage server during file sync.", ctx->peer_ip, ctx->peer_port);
+                protocol_free_message(&file_msg);
+                free(file_msg_raw);
+                continue;
+            }
+
+            time_t now = get_current_time();
+            FileIndexNode *existing = file_index_find(ns, filename);
+            if (existing && existing->file_array_index >= 0 && existing->file_array_index < ns->file_count) {
+                FileMetadata *file = &ns->files[existing->file_array_index];
+                safe_strcpy(file->ss_ip, ss->client_ip, sizeof(file->ss_ip));
+                file->ss_port = ss->client_port;
+                file->modified = now;
+                log_message(LOG_INFO, "NS", "Updated file '%s' location to %s:%d", filename, ss->client_ip, ss->client_port);
+                file_cache_store(ns, filename, existing->file_array_index);
+            } else {
+                if (ns->file_count >= NS_MAX_FILES) {
+                    pthread_mutex_unlock(&ns->state_lock);
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Maximum file limit reached.", ctx->peer_ip, ctx->peer_port);
+                    protocol_free_message(&file_msg);
+                    free(file_msg_raw);
+                    continue;
+                }
+
+                int new_index = ns->file_count;
+                FileMetadata *file = &ns->files[new_index];
+                memset(file, 0, sizeof(FileMetadata));
+                safe_strcpy(file->filename, filename, sizeof(file->filename));
+                file->owner[0] = '\0';
+                safe_strcpy(file->ss_ip, ss->client_ip, sizeof(file->ss_ip));
+                file->ss_port = ss->client_port;
+                file->created = now;
+                file->modified = now;
+
+                if (file_index_insert(ns, filename, new_index) != 0) {
+                    memset(file, 0, sizeof(FileMetadata));
+                    pthread_mutex_unlock(&ns->state_lock);
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to index file metadata.", ctx->peer_ip, ctx->peer_port);
+                    protocol_free_message(&file_msg);
+                    free(file_msg_raw);
+                    continue;
+                }
+
+                ns->file_count++;
+                file_cache_store(ns, filename, new_index);
+                log_message(LOG_INFO, "NS", "Registered file '%s' at index %d", filename, new_index);
+            }
+
+            pthread_mutex_unlock(&ns->state_lock);
         } else if (strcmp(file_msg.fields[0], MSG_SS_FILES_DONE) == 0) {
             log_message(LOG_INFO, "NS", "SS %s:%d file sync complete.", ctx->peer_ip, ctx->peer_port);
             protocol_free_message(&file_msg);
@@ -136,6 +419,7 @@ static void run_ss_loop(ConnectionContext *ctx) {
         free(file_msg_raw);
     }
 
+    // Main loop to handle storage server commands
     while (1) {
         char *raw_command = protocol_receive_message(ctx->conn_fd);
         if (!raw_command) {
@@ -499,6 +783,16 @@ void ns_cleanup(NameServer *ns) {
         if (ns->storage_servers[i].sockfd >= 0) {
             close(ns->storage_servers[i].sockfd);
         }
+    }
+
+    for (int i = 0; i < FILE_INDEX_SIZE; i++) {
+        FileIndexNode *node = ns->file_index[i];
+        while (node) {
+            FileIndexNode *next = node->next;
+            free(node);
+            node = next;
+        }
+        ns->file_index[i] = NULL;
     }
     
     pthread_mutex_destroy(&ns->state_lock);

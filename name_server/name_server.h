@@ -41,6 +41,24 @@ typedef struct {
     int is_connected;
 } ClientInfo;
 
+// Node for filename -> metadata index lookups
+typedef struct FileIndexNode {
+    char filename[MAX_FILENAME_LENGTH];
+    int file_array_index;
+    struct FileIndexNode *next;
+} FileIndexNode;
+
+#define FILE_INDEX_SIZE 1024
+
+typedef struct {
+    char filename[MAX_FILENAME_LENGTH];
+    int file_array_index;
+    int valid;
+    unsigned long last_used;
+} FileCacheEntry;
+
+#define FILE_CACHE_SIZE 64
+
 // Name Server structure
 typedef struct {
     int port; // Port number the Name Server listens on
@@ -56,6 +74,10 @@ typedef struct {
     int file_count; // Count of files currently managed by the Name Server
 
     pthread_mutex_t state_lock; // Mutex to protect shared state (e.g., storage_servers, clients, files)
+
+    FileIndexNode *file_index[FILE_INDEX_SIZE]; // Hash map buckets for fast file lookups
+    FileCacheEntry file_cache[FILE_CACHE_SIZE]; // Cache for recent lookups
+    unsigned long cache_tick; // Monotonic counter for cache usage tracking
 } NameServer;
 
 /**
