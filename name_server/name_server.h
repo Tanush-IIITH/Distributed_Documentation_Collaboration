@@ -18,7 +18,10 @@ typedef struct {
     int ss_port;
     time_t created;
     time_t modified;
-    // Access control list would go here
+    char read_access_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
+    char write_access_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
+    int read_access_count;
+    int write_access_count;
 } FileMetadata;
 
 // Storage Server information

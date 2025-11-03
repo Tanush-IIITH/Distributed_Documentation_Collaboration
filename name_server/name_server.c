@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
+#include <strings.h>
 
 // Initialize the Name Server
 int ns_init(NameServer *ns, int port) {
@@ -74,7 +75,7 @@ static void send_error_and_log(int fd, int code, const char *message, const char
     In case of collisions (two filenames producing the same hash value), a linked list is used to store multiple entries in the same bucket.
 */
 
-//hash function for filenames
+//hash function for filenames (djb2 variant keeps distribution stable across runs)
 static unsigned long hash_filename(const char *str) {
     unsigned long hash = 5381;
     int c;
@@ -84,7 +85,7 @@ static unsigned long hash_filename(const char *str) {
     return hash;
 }
 
-//find file index node by filename
+//find file metadata index from hash buckets
 static FileIndexNode *file_index_find(NameServer *ns, const char *filename) {
     if (!ns || !filename) {
         return NULL;
@@ -101,7 +102,7 @@ static FileIndexNode *file_index_find(NameServer *ns, const char *filename) {
     return NULL;
 }
 
-//insert file index node
+//insert or update hash bucket entry for a filename
 static int file_index_insert(NameServer *ns, const char *filename, int array_index) {
     if (!ns || !filename || array_index < 0) {
         return -1;
@@ -177,7 +178,7 @@ static int file_cache_lookup(NameServer *ns, const char *filename, FileMetadata 
     return 0;
 }
 
-//LRU file cache store
+//LRU file cache store to remember recent filename -> metadata mappings
 static void file_cache_store(NameServer *ns, const char *filename, int array_index) {
     if (!ns || !filename || array_index < 0 || array_index >= ns->file_count) {
         return;
@@ -234,6 +235,115 @@ static void file_cache_store(NameServer *ns, const char *filename, int array_ind
     target->valid = 1;
 }
 
+static int file_acl_contains(char entries[][MAX_USERNAME_LENGTH], int count, const char *username) {
+    if (!username) {
+        return 0;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (strncmp(entries[i], username, MAX_USERNAME_LENGTH) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int file_acl_add(char entries[][MAX_USERNAME_LENGTH], int *count, const char *username) {
+    if (!entries || !count || !username) {
+        return -1;
+    }
+
+    if (file_acl_contains(entries, *count, username)) {
+        return 0;
+    }
+
+    if (*count >= NS_MAX_CLIENTS) {
+        return -1;
+    }
+
+    if (safe_strcpy(entries[*count], username, MAX_USERNAME_LENGTH) != 0) {
+        return -1;
+    }
+
+    (*count)++;
+    return 0;
+}
+
+static int file_acl_remove(char entries[][MAX_USERNAME_LENGTH], int *count, const char *username) {
+    if (!entries || !count || !username) {
+        return 0;
+    }
+
+    for (int i = 0; i < *count; i++) {
+        if (strncmp(entries[i], username, MAX_USERNAME_LENGTH) == 0) {
+            int last_index = *count - 1;
+            if (i != last_index) {
+                memcpy(entries[i], entries[last_index], MAX_USERNAME_LENGTH);
+            }
+            entries[last_index][0] = '\0';
+            (*count)--;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int file_add_access(FileMetadata *file, const char *username, int grant_read, int grant_write) {
+    if (!file || !username) {
+        return -1;
+    }
+
+    if (grant_read) {
+        if (file_acl_add(file->read_access_users, &file->read_access_count, username) != 0) {
+            return -1;
+        }
+    }
+
+    if (grant_write) {
+        if (file_acl_add(file->write_access_users, &file->write_access_count, username) != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int file_remove_access(FileMetadata *file, const char *username) {
+    if (!file || !username) {
+        return 0;
+    }
+
+    int removed = 0;
+    removed |= file_acl_remove(file->read_access_users, &file->read_access_count, username);
+    removed |= file_acl_remove(file->write_access_users, &file->write_access_count, username);
+    return removed;
+}
+
+static int parse_permission_flags(const char *perm, int *grant_read, int *grant_write) {
+    if (!perm || !grant_read || !grant_write) {
+        return -1;
+    }
+
+    *grant_read = 0;
+    *grant_write = 0;
+
+    if (strcasecmp(perm, "R") == 0 || strcasecmp(perm, "READ") == 0) {
+        *grant_read = 1;
+    } else if (strcasecmp(perm, "W") == 0 || strcasecmp(perm, "WRITE") == 0) {
+        *grant_write = 1;
+    } else if (strcasecmp(perm, "RW") == 0 || strcasecmp(perm, "WR") == 0 ||
+               strcasecmp(perm, "READWRITE") == 0 || strcasecmp(perm, "WRITEREAD") == 0) {
+        *grant_read = 1;
+        *grant_write = 1;
+    } else {
+        return -1;
+    }
+
+    return 0;
+}
+
 //client command processing loop
 static void run_client_loop(ConnectionContext *ctx) {
     if (!ctx || !ctx->ns) {
@@ -263,7 +373,77 @@ static void run_client_loop(ConnectionContext *ctx) {
         if (strcmp(command, MSG_LIST_USERS) == 0) {
             // TODO: Handle LIST_USERS
         } else if (strcmp(command, MSG_CREATE) == 0) {
-            // TODO: Handle CREATE
+            // Create flow: validate request, register metadata locally, defer physical creation to storage server layer
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in CREATE.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+
+                if (!validate_filename(filename)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename requested for CREATE.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    int result = -1;
+                    pthread_mutex_lock(&ns->state_lock);
+
+                    if (ns->file_count >= NS_MAX_FILES) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Maximum file limit reached.", ctx->peer_ip, ctx->peer_port);
+                    } else if (file_index_find(ns, filename) != NULL) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_FILE_EXISTS, "File already exists.", ctx->peer_ip, ctx->peer_port);
+                    } else if (ns->ss_count == 0) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "No storage servers available.", ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        // TODO: load-balance across storage servers; currently pick the first registered node
+                        StorageServerInfo *target_ss = &ns->storage_servers[0];
+                        int new_index = ns->file_count;
+                        FileMetadata *file = &ns->files[new_index];
+                        memset(file, 0, sizeof(FileMetadata));
+
+                        if (safe_strcpy(file->filename, filename, sizeof(file->filename)) != 0 ||
+                            safe_strcpy(file->owner, ctx->username, sizeof(file->owner)) != 0 ||
+                            safe_strcpy(file->ss_ip, target_ss->client_ip, sizeof(file->ss_ip)) != 0) {
+                            memset(file, 0, sizeof(FileMetadata));
+                            pthread_mutex_unlock(&ns->state_lock);
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to record file metadata.", ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            file->ss_port = target_ss->client_port;
+                            time_t now = get_current_time();
+                            file->created = now;
+                            file->modified = now;
+                            file->read_access_count = 0;
+                            file->write_access_count = 0;
+
+                            if (file_index_insert(ns, filename, new_index) != 0) {
+                                memset(file, 0, sizeof(FileMetadata));
+                                pthread_mutex_unlock(&ns->state_lock);
+                                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to index new file.", ctx->peer_ip, ctx->peer_port);
+                            } else {
+                                ns->file_count++;
+                                file_cache_store(ns, filename, new_index);
+                                result = 0;
+                                pthread_mutex_unlock(&ns->state_lock);
+
+                                if (result == 0) {
+                                    char detail[MAX_FIELD_SIZE];
+                                    snprintf(detail, sizeof(detail), "File '%s' registered to %s:%d.", filename, target_ss->client_ip, target_ss->client_port);
+                                    char *resp = protocol_build_ok(detail);
+                                    if (resp) {
+                                        protocol_send_message(ctx->conn_fd, resp);
+                                        free(resp);
+                                    } else {
+                                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
+                                    }
+                                    log_message(LOG_INFO, "NS", "File '%s' created by %s.", filename, ctx->username);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         } else if (strcmp(command, MSG_REQ_LOC) == 0) {
             if (cmd_msg.field_count < 2) {
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in location request.", ctx->peer_ip, ctx->peer_port);
@@ -303,6 +483,100 @@ static void run_client_loop(ConnectionContext *ctx) {
                         }
                     } else {
                         send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "Requested file not found.", ctx->peer_ip, ctx->peer_port);
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_ADDACCESS) == 0) {
+            if (cmd_msg.field_count < 4) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Missing parameters for ADDACCESS.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+                const char *target_user = cmd_msg.fields[2];
+                const char *permission = cmd_msg.fields[3];
+
+                int grant_read = 0;
+                int grant_write = 0;
+
+                if (!validate_filename(filename) || !validate_username(target_user)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename or username for ADDACCESS.", ctx->peer_ip, ctx->peer_port);
+                } else if (parse_permission_flags(permission, &grant_read, &grant_write) != 0 || (!grant_read && !grant_write)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid permission token for ADDACCESS.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    int result = -1;
+                    pthread_mutex_lock(&ns->state_lock);
+                    FileIndexNode *node = file_index_find(ns, filename);
+                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for ADDACCESS.", ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        FileMetadata *file = &ns->files[node->file_array_index];
+                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                            pthread_mutex_unlock(&ns->state_lock);
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may modify access.", ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            result = file_add_access(file, target_user, grant_read, grant_write);
+                            pthread_mutex_unlock(&ns->state_lock);
+
+                            if (result != 0) {
+                                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
+                            } else {
+                                char detail[MAX_FIELD_SIZE];
+                                snprintf(detail, sizeof(detail), "Access granted to %s (%s).", target_user, permission);
+                                char *resp = protocol_build_ok(detail);
+                                if (resp) {
+                                    protocol_send_message(ctx->conn_fd, resp);
+                                    free(resp);
+                                } else {
+                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_REMACCESS) == 0) {
+            if (cmd_msg.field_count < 3) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Missing parameters for REMACCESS.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+                const char *target_user = cmd_msg.fields[2];
+
+                if (!validate_filename(filename) || !validate_username(target_user)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename or username for REMACCESS.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    int removed = 0;
+                    pthread_mutex_lock(&ns->state_lock);
+                    FileIndexNode *node = file_index_find(ns, filename);
+                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for REMACCESS.", ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        FileMetadata *file = &ns->files[node->file_array_index];
+                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                            pthread_mutex_unlock(&ns->state_lock);
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may modify access.", ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            removed = file_remove_access(file, target_user);
+                            pthread_mutex_unlock(&ns->state_lock);
+
+                            if (!removed) {
+                                send_error_and_log(ctx->conn_fd, ERR_USER_NOT_FOUND, "User had no explicit access.", ctx->peer_ip, ctx->peer_port);
+                            } else {
+                                char detail[MAX_FIELD_SIZE];
+                                snprintf(detail, sizeof(detail), "Access revoked for %s.", target_user);
+                                char *resp = protocol_build_ok(detail);
+                                if (resp) {
+                                    protocol_send_message(ctx->conn_fd, resp);
+                                    free(resp);
+                                } else {
+                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
+                                }
+                            }
+                        }
                     }
                 }
             }
