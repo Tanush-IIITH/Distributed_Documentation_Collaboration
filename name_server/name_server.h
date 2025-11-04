@@ -81,6 +81,7 @@ typedef struct {
     FileIndexNode *file_index[FILE_INDEX_SIZE]; // Hash map buckets for fast file lookups
     FileCacheEntry file_cache[FILE_CACHE_SIZE]; // Cache for recent lookups
     unsigned long cache_tick; // Monotonic counter for cache usage tracking
+    int ss_round_robin_index; // Index of the next storage server to use for balancing
 } NameServer;
 
 /**

@@ -26,6 +26,7 @@ int ns_init(NameServer *ns, int port) {
     memset(ns->file_index, 0, sizeof(ns->file_index));
     memset(ns->file_cache, 0, sizeof(ns->file_cache));
     ns->cache_tick = 0;
+    ns->ss_round_robin_index = 0;
     if (pthread_mutex_init(&ns->state_lock, NULL) != 0) {
         log_message(LOG_ERROR, "NS", "Failed to initialize mutex: %s", strerror(errno));
         return -1;
@@ -424,8 +425,26 @@ static void run_client_loop(ConnectionContext *ctx) {
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "No storage servers available.", ctx->peer_ip, ctx->peer_port);
                     } else {
-                        // TODO: load-balance across storage servers; currently pick the first registered node
-                        StorageServerInfo *target_ss = &ns->storage_servers[0];
+                        // Round-robin load balancing across live storage servers
+                        StorageServerInfo *target_ss = NULL;
+                        int start_index = ns->ss_round_robin_index;
+
+                        for (int i = 0; i < ns->ss_count; i++) {
+                            int current_index = (start_index + i) % ns->ss_count;
+                            if (!ns->storage_servers[current_index].is_alive) {
+                                continue;
+                            }
+                            target_ss = &ns->storage_servers[current_index];
+                            ns->ss_round_robin_index = (current_index + 1) % ns->ss_count;
+                            break;
+                        }
+
+                        if (!target_ss) {
+                            pthread_mutex_unlock(&ns->state_lock);
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "No alive storage servers available.", ctx->peer_ip, ctx->peer_port);
+                            continue;
+                        }
+
                         int new_index = ns->file_count;
                         FileMetadata *file = &ns->files[new_index];
                         memset(file, 0, sizeof(FileMetadata));
