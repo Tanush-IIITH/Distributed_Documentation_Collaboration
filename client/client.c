@@ -135,12 +135,62 @@ int client_process_command(Client *client, const char *input) {
     if (!client || !input) {
         return -1;
     }
-    
-    // TODO: Implement command processing
-    // Parse input and route to appropriate handler
-    // Commands: CREATE, DELETE, READ, WRITE, VIEW, INFO, STREAM, 
-    //           UNDO, EXEC, LIST, ADDACCESS, REMACCESS, etc.
-    
+
+    // Parse command keyword; arguments will be handled by respective helpers later
+    char command[CLIENT_BUFFER_SIZE];
+    if (sscanf(input, "%s", command) != 1) {
+        return -1;
+    }
+
+    if (strcasecmp(command, "VIEW") == 0) {
+        // TODO: handle VIEW (with optional flags -a, -l)
+    } else if (strcasecmp(command, "READ") == 0) {
+        // TODO: handle READ <filename>
+    } else if (strcasecmp(command, "CREATE") == 0) {
+        // TODO: handle CREATE <filename>
+    } else if (strcasecmp(command, "WRITE") == 0) {
+        // TODO: handle WRITE <filename> <sentence_number>
+    } else if (strcasecmp(command, "UNDO") == 0) {
+        // TODO: handle UNDO <filename>
+    } else if (strcasecmp(command, "INFO") == 0) {
+        // TODO: handle INFO <filename>
+    } else if (strcasecmp(command, "DELETE") == 0) {
+        // TODO: handle DELETE <filename>
+    } else if (strcasecmp(command, "STREAM") == 0) {
+        // TODO: handle STREAM <filename>
+    } else if (strcasecmp(command, "LIST") == 0) {
+        // TODO: handle LIST users (LIST or LIST USERS)
+    } else if (strcasecmp(command, "ADDACCESS") == 0) {
+        // TODO: handle ADDACCESS -R|-W <filename> <username>
+    } else if (strcasecmp(command, "REMACCESS") == 0) {
+        // TODO: handle REMACCESS <filename> <username>
+    } else if (strcasecmp(command, "EXEC") == 0) {
+        // TODO: handle EXEC <filename>
+    } else if (strcasecmp(command, "CREATEFOLDER") == 0) {
+        // TODO: handle CREATEFOLDER <foldername>
+    } else if (strcasecmp(command, "MOVE") == 0) {
+        // TODO: handle MOVE <filename> <foldername>
+    } else if (strcasecmp(command, "VIEWFOLDER") == 0) {
+        // TODO: handle VIEWFOLDER <foldername>
+    } else if (strcasecmp(command, "CHECKPOINT") == 0) {
+        // TODO: handle CHECKPOINT <filename> <checkpoint_tag>
+    } else if (strcasecmp(command, "VIEWCHECKPOINT") == 0) {
+        // TODO: handle VIEWCHECKPOINT <filename> <checkpoint_tag>
+    } else if (strcasecmp(command, "REVERT") == 0) {
+        // TODO: handle REVERT <filename> <checkpoint_tag>
+    } else if (strcasecmp(command, "LISTCHECKPOINTS") == 0) {
+        // TODO: handle LISTCHECKPOINTS <filename>
+    } else if (strcasecmp(command, "REQUESTACCESS") == 0) {
+        // TODO: handle REQUESTACCESS <filename> <permission>
+    } else if (strcasecmp(command, "APPROVEACCESS") == 0) {
+        // TODO: handle APPROVEACCESS <filename> <username>
+    } else if (strcasecmp(command, "REJECTACCESS") == 0) {
+        // TODO: handle REJECTACCESS <filename> <username>
+    } else {
+        printf("Unknown command: %s\n", command);
+        return -1;
+    }
+
     return 0;
 }
 
