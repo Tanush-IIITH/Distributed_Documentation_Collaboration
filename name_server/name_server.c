@@ -427,6 +427,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                                 result = 0;
                                 pthread_mutex_unlock(&ns->state_lock);
 
+                                //not necessary but just for modularity
                                 if (result == 0) {
                                     char detail[MAX_FIELD_SIZE];
                                     snprintf(detail, sizeof(detail), "File '%s' registered to %s:%d.", filename, target_ss->client_ip, target_ss->client_port);
@@ -1029,12 +1030,36 @@ int ns_find_storage_server(NameServer *ns, const char *filename) {
     if (!ns || !filename) {
         return -1;
     }
-    
-    // TODO: Implement file location lookup
-    // 1. Search file metadata
-    // 2. Return SS index
-    
-    return -1;
+
+    int ss_index = -1;
+
+    // Protect shared metadata structures while resolving the filename → storage server mapping
+    pthread_mutex_lock(&ns->state_lock);
+
+    // Step 1: Resolve the filename to its metadata entry using the hash index
+    FileIndexNode *node = file_index_find(ns, filename);
+    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+        pthread_mutex_unlock(&ns->state_lock);
+        return -1;
+    }
+
+    // Step 2: Access the FileMetadata record to obtain the recorded storage server location
+    FileMetadata *file = &ns->files[node->file_array_index];
+
+    // Step 3: Find the live storage server whose client-facing address matches the file location
+    for (int i = 0; i < ns->ss_count; i++) {
+        StorageServerInfo *ss = &ns->storage_servers[i];
+        if (!ss->is_alive) {
+            continue;
+        }
+        if (strncmp(ss->client_ip, file->ss_ip, MAX_IP_LENGTH) == 0 && ss->client_port == file->ss_port) {
+            ss_index = i;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&ns->state_lock);
+    return ss_index;
 }
 
 void ns_cleanup(NameServer *ns) {
