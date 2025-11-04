@@ -371,7 +371,34 @@ static void run_client_loop(ConnectionContext *ctx) {
                     ctx->username[0] ? ctx->username : NULL, command);
 
         if (strcmp(command, MSG_LIST_USERS) == 0) {
-            // TODO: Handle LIST_USERS
+            // Enumerate every connected user and stream back their usernames to the requester
+            pthread_mutex_lock(&ns->state_lock);
+            for (int i = 0; i < ns->client_count; i++) {
+                if (!ns->clients[i].is_connected) {
+                    continue;
+                }
+
+                const char *fields[] = {RESP_OK_LIST, ns->clients[i].username};
+                char *resp = protocol_build_message(fields, 2);
+                if (!resp) {
+                    log_message(LOG_WARNING, "NS", "Failed to build LIST_USERS entry for %s.", ns->clients[i].username);
+                    continue;
+                }
+
+                protocol_send_message(ctx->conn_fd, resp);
+                free(resp);
+            }
+            pthread_mutex_unlock(&ns->state_lock);
+
+            // Signal to the client that the stream has finished
+            const char *end_fields[] = {RESP_OK_LIST_END};
+            char *end_msg = protocol_build_message(end_fields, 1);
+            if (end_msg) {
+                protocol_send_message(ctx->conn_fd, end_msg);
+                free(end_msg);
+            } else {
+                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build LIST_USERS terminator.", ctx->peer_ip, ctx->peer_port);
+            }
         } else if (strcmp(command, MSG_CREATE) == 0) {
             // Create flow: validate request, register metadata locally, defer physical creation to storage server layer
             if (cmd_msg.field_count < 2) {
