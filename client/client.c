@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <errno.h>
 
 int client_init(Client *client, const char *username, const char *ns_ip, int ns_port) {
     if (!client || !username || !ns_ip) {
@@ -32,14 +33,87 @@ int client_connect_to_ns(Client *client) {
     if (!client) {
         return -1;
     }
-    
-    // TODO: Implement NS connection
-    // 1. Create socket
-    // 2. Connect to NS
-    // 3. Send HELLO_CLIENT message
-    // 4. Wait for OK response
-    
+
+    // Step 1: Create the TCP socket that will carry requests to the Name Server
+    client->ns_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client->ns_sockfd < 0) {
+        log_message(LOG_ERROR, "Client", "Failed to create socket: %s", strerror(errno));
+        return -1;
+    }
+
+    // Step 2: Populate the destination address using the configured IP/port
+    struct sockaddr_in ns_addr;
+    memset(&ns_addr, 0, sizeof(ns_addr));
+    ns_addr.sin_family = AF_INET;
+    ns_addr.sin_port = htons(client->ns_port);
+    if (inet_pton(AF_INET, client->ns_ip, &ns_addr.sin_addr) <= 0) {
+        log_message(LOG_ERROR, "Client", "Invalid Name Server IP address: %s", client->ns_ip);
+        close(client->ns_sockfd);
+        client->ns_sockfd = -1;
+        return -1;
+    }
+
+    // Step 3: Establish the TCP connection to the Name Server
+    if (connect(client->ns_sockfd, (struct sockaddr *)&ns_addr, sizeof(ns_addr)) < 0) {
+        log_message(LOG_ERROR, "Client", "Failed to connect to Name Server %s:%d: %s", client->ns_ip,
+                    client->ns_port, strerror(errno));
+        close(client->ns_sockfd);
+        client->ns_sockfd = -1;
+        return -1;
+    }
+
+    // Step 4: Compose the HELLO_CLIENT handshake message
+    const char *fields[] = {MSG_HELLO_CLIENT, client->username};
+    char *handshake = protocol_build_message(fields, 2);
+    if (!handshake) {
+        log_message(LOG_ERROR, "Client", "Failed to build HELLO_CLIENT message");
+        close(client->ns_sockfd);
+        client->ns_sockfd = -1;
+        return -1;
+    }
+
+    // Step 5: Send the handshake to the Name Server
+    if (protocol_send_message(client->ns_sockfd, handshake) < 0) {
+        log_message(LOG_ERROR, "Client", "Failed to send HELLO_CLIENT message");
+        free(handshake);
+        close(client->ns_sockfd);
+        client->ns_sockfd = -1;
+        return -1;
+    }
+    free(handshake);
+
+    // Step 6: Await the Name Server's response and verify it
+    char *raw_response = protocol_receive_message(client->ns_sockfd);
+    if (!raw_response) {
+        log_message(LOG_ERROR, "Client", "No response from Name Server during handshake");
+        close(client->ns_sockfd);
+        client->ns_sockfd = -1;
+        return -1;
+    }
+
+    ProtocolMessage response;
+    if (protocol_parse_message(raw_response, &response) != 0) {
+        log_message(LOG_ERROR, "Client", "Failed to parse Name Server handshake response");
+        free(raw_response);
+        close(client->ns_sockfd);
+        client->ns_sockfd = -1;
+        return -1;
+    }
+
+    if (protocol_is_error(&response)) {
+        int err_code = protocol_get_error_code(&response);
+        const char *detail = (response.field_count >= 3) ? response.fields[2] : "Unknown error";
+        log_message(LOG_ERROR, "Client", "Name Server rejected handshake (code %d): %s", err_code, detail);
+        protocol_free_message(&response);
+        free(raw_response);
+        close(client->ns_sockfd);
+        client->ns_sockfd = -1;
+        return -1;
+    }
+
     log_message(LOG_INFO, "Client", "Connected to Name Server");
+    protocol_free_message(&response);
+    free(raw_response);
     return 0;
 }
 
