@@ -8,6 +8,13 @@
 #include <arpa/inet.h>
 #include <errno.h>
 
+static int client_handle_view(Client *client, const char *flags);
+static int client_handle_list(Client *client);
+static int client_handle_addaccess(Client *client, const char *perm_flag, const char *filename, const char *username);
+static int client_handle_remaccess(Client *client, const char *filename, const char *username);
+static int client_handle_create(Client *client, const char *filename);
+static int client_handle_read(Client *client, const char *filename);
+
 int client_init(Client *client, const char *username, const char *ns_ip, int ns_port) {
     if (!client || !username || !ns_ip) {
         return -1;
@@ -143,11 +150,30 @@ int client_process_command(Client *client, const char *input) {
     }
 
     if (strcasecmp(command, "VIEW") == 0) {
-        // TODO: handle VIEW (with optional flags -a, -l)
+        // Extract optional flags (e.g., "-a") if the user provided any.
+        const char *flag_ptr = strchr(input, ' ');
+        char flags_buffer[CLIENT_BUFFER_SIZE] = {0};
+        if (flag_ptr) {
+            flag_ptr++;
+            while (*flag_ptr == ' ') {
+                flag_ptr++;
+            }
+            if (*flag_ptr != '\0') {
+                strncpy(flags_buffer, flag_ptr, sizeof(flags_buffer) - 1);
+                trim_string(flags_buffer);
+            }
+        }
+        const char *flags = flags_buffer[0] ? flags_buffer : NULL;
+        return client_handle_view(client, flags);
     } else if (strcasecmp(command, "READ") == 0) {
         // TODO: handle READ <filename>
     } else if (strcasecmp(command, "CREATE") == 0) {
-        // TODO: handle CREATE <filename>
+        char filename[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", filename) != 1) {
+            printf("Usage: CREATE <filename>\n");
+            return -1;
+        }
+        return client_handle_create(client, filename);
     } else if (strcasecmp(command, "WRITE") == 0) {
         // TODO: handle WRITE <filename> <sentence_number>
     } else if (strcasecmp(command, "UNDO") == 0) {
@@ -159,11 +185,24 @@ int client_process_command(Client *client, const char *input) {
     } else if (strcasecmp(command, "STREAM") == 0) {
         // TODO: handle STREAM <filename>
     } else if (strcasecmp(command, "LIST") == 0) {
-        // TODO: handle LIST users (LIST or LIST USERS)
+        return client_handle_list(client);
     } else if (strcasecmp(command, "ADDACCESS") == 0) {
-        // TODO: handle ADDACCESS -R|-W <filename> <username>
+        char perm[16];
+        char filename[MAX_FILENAME_LENGTH];
+        char target[MAX_USERNAME_LENGTH];
+        if (sscanf(input, "%*s %15s %511s %255s", perm, filename, target) != 3) {
+            printf("Usage: ADDACCESS -R|-W <filename> <username>\n");
+            return -1;
+        }
+        return client_handle_addaccess(client, perm, filename, target);
     } else if (strcasecmp(command, "REMACCESS") == 0) {
-        // TODO: handle REMACCESS <filename> <username>
+        char filename[MAX_FILENAME_LENGTH];
+        char target[MAX_USERNAME_LENGTH];
+        if (sscanf(input, "%*s %511s %255s", filename, target) != 2) {
+            printf("Usage: REMACCESS <filename> <username>\n");
+            return -1;
+        }
+        return client_handle_remaccess(client, filename, target);
     } else if (strcasecmp(command, "EXEC") == 0) {
         // TODO: handle EXEC <filename>
     } else if (strcasecmp(command, "CREATEFOLDER") == 0) {
@@ -192,6 +231,291 @@ int client_process_command(Client *client, const char *input) {
     }
 
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Command handlers that talk to the Name Server directly
+// ---------------------------------------------------------------------------
+
+static int client_send_message(Client *client, char *message) {
+    if (!client || client->ns_sockfd < 0 || !message) {
+        return -1;
+    }
+    int rc = protocol_send_message(client->ns_sockfd, message);
+    free(message);
+    return rc;
+}
+
+static int client_read_response(Client *client, ProtocolMessage *out_msg, char **out_raw) {
+    if (!client || client->ns_sockfd < 0 || !out_msg || !out_raw) {
+        return -1;
+    }
+
+    char *raw = protocol_receive_message(client->ns_sockfd);
+    if (!raw) {
+        return -1;
+    }
+    if (protocol_parse_message(raw, out_msg) != 0) {
+        free(raw);
+        return -1;
+    }
+
+    *out_raw = raw;
+    return 0;
+}
+
+static void client_print_ns_response(const ProtocolMessage *msg) {
+    if (!msg) {
+        return;
+    }
+
+    if (protocol_is_error(msg)) {
+        printf("Error: %s\n", msg->field_count >= 3 ? msg->fields[2] : "Unknown error");
+    } else if (msg->field_count >= 2) {
+        printf("%s\n", msg->fields[1]);
+    } else {
+        printf("OK\n");
+    }
+}
+
+// Streams filenames the user can access via VIEW.
+static int client_handle_view(Client *client, const char *flags) {
+    if (!client || client->ns_sockfd < 0) {
+        return -1;
+    }
+
+    int request_all = 0;
+    int request_details = 0;
+    int invalid_flag = 0;
+
+    if (flags) {
+        for (const char *p = flags; *p; p++) {
+            if (*p == '-' || *p == ' ' || *p == '\t') {
+                continue;
+            }
+            if (*p == 'a' || *p == 'A') {
+                request_all = 1;
+            } else if (*p == 'l' || *p == 'L') {
+                request_details = 1;
+            } else {
+                invalid_flag = 1;
+                break;
+            }
+        }
+    }
+
+    if (invalid_flag) {
+        printf("Invalid VIEW flag. Use -a, -l, or -al.\n");
+        return -1;
+    }
+
+    const char *fields[2] = {MSG_VIEW, NULL};
+    int field_count = 1;
+    if (flags && flags[0] != '\0') {
+        fields[1] = flags;
+        field_count = 2;
+    }
+
+    char *message = protocol_build_message(fields, field_count);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send VIEW command\n");
+        return -1;
+    }
+
+    printf("%s files%s:\n", request_all ? "All" : "Accessible", request_details ? " (detailed)" : "");
+    while (1) {
+        ProtocolMessage msg;
+        char *raw = NULL;
+        if (client_read_response(client, &msg, &raw) != 0) {
+            printf("Connection lost while viewing files\n");
+            return -1;
+        }
+
+        if (msg.field_count > 0 && strcmp(msg.fields[0], RESP_OK_VIEW_END) == 0) {
+            protocol_free_message(&msg);
+            free(raw);
+            break;
+        }
+
+        if (msg.field_count >= 2 && strcmp(msg.fields[0], RESP_OK_VIEW_L) == 0) {
+            if (msg.field_count >= 7) {
+                printf(" - %s\n", msg.fields[1]);
+                printf("   owner: %s\n", msg.fields[2][0] ? msg.fields[2] : "N/A");
+                printf("   words: %s, chars: %s\n", msg.fields[3], msg.fields[4]);
+                printf("   last access: %s\n", msg.fields[5]);
+                printf("   last modified: %s\n", msg.fields[6]);
+            } else {
+                printf(" - %s\n", msg.fields[1]);
+            }
+        } else if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    return 0;
+}
+
+static int client_handle_list(Client *client) {
+    if (!client || client->ns_sockfd < 0) {
+        return -1;
+    }
+
+    const char *fields[] = {MSG_LIST_USERS};
+    char *message = protocol_build_message(fields, 1);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send LIST command\n");
+        return -1;
+    }
+
+    printf("Users:\n");
+    while (1) {
+        ProtocolMessage msg;
+        char *raw = NULL;
+        if (client_read_response(client, &msg, &raw) != 0) {
+            printf("Connection lost while listing users\n");
+            return -1;
+        }
+
+        if (msg.field_count > 0 && strcmp(msg.fields[0], RESP_OK_LIST_END) == 0) {
+            protocol_free_message(&msg);
+            free(raw);
+            break;
+        }
+
+        if (msg.field_count >= 2 && strcmp(msg.fields[0], RESP_OK_LIST) == 0) {
+            printf(" - %s\n", msg.fields[1]);
+        } else if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    return 0;
+}
+
+static int client_handle_addaccess(Client *client, const char *perm_flag, const char *filename, const char *username) {
+    if (!client || client->ns_sockfd < 0) {
+        return -1;
+    }
+
+    const char *fields[] = {MSG_ADDACCESS, filename, username, perm_flag};
+    char *message = protocol_build_message(fields, 4);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send ADDACCESS command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for ADDACCESS\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    protocol_free_message(&resp);
+    free(raw);
+    return 0;
+}
+
+static int client_handle_remaccess(Client *client, const char *filename, const char *username) {
+    if (!client || client->ns_sockfd < 0) {
+        return -1;
+    }
+
+    const char *fields[] = {MSG_REMACCESS, filename, username};
+    char *message = protocol_build_message(fields, 3);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send REMACCESS command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for REMACCESS\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    protocol_free_message(&resp);
+    free(raw);
+    return 0;
+}
+
+// Function to handle the CREATE command from the client
+static int client_handle_create(Client *client, const char *filename) {
+    // Validate client and filename
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    // Ensure the filename is valid
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    // Build the CREATE message to send to the Name Server
+    const char *fields[] = {MSG_CREATE, filename};
+    char *message = protocol_build_message(fields, 2);
+    if (!message) {
+        return -1;
+    }
+
+    // Send the CREATE message to the Name Server
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send CREATE command\n");
+        return -1;
+    }
+
+    // Read the response from the Name Server
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for CREATE\n");
+        return -1;
+    }
+
+    // Print the response received from the Name Server
+    client_print_ns_response(&resp);
+
+    // Check if the response indicates an error
+    int is_error = protocol_is_error(&resp);
+
+    // Free allocated resources
+    protocol_free_message(&resp);
+    free(raw);
+
+    // Return success or error based on the response
+    return is_error ? -1 : 0;
 }
 
 int client_start(Client *client) {

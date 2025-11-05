@@ -400,6 +400,108 @@ static void run_client_loop(ConnectionContext *ctx) {
             } else {
                 send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build LIST_USERS terminator.", ctx->peer_ip, ctx->peer_port);
             }
+        } else if (strcmp(command, MSG_VIEW) == 0) {
+            const char *flags = (cmd_msg.field_count >= 2) ? cmd_msg.fields[1] : "";
+            int request_all = 0;
+            int request_details = 0;
+            int invalid_flag = 0;
+
+            if (flags) {
+                for (const char *p = flags; *p; p++) {
+                    if (*p == '-' || *p == ' ' || *p == '\t') {
+                        continue;
+                    }
+                    if (*p == 'a' || *p == 'A') {
+                        request_all = 1;
+                    } else if (*p == 'l' || *p == 'L') {
+                        request_details = 1;
+                    } else {
+                        invalid_flag = 1;
+                        break;
+                    }
+                }
+            }
+
+            if (invalid_flag) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Unsupported VIEW flag.", ctx->peer_ip, ctx->peer_port);
+            } else if (ctx->username[0] == '\0') {
+                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                pthread_mutex_lock(&ns->state_lock);
+                for (int i = 0; i < ns->file_count; i++) {
+                    FileMetadata *file = &ns->files[i];
+                    int has_access = request_all;
+
+                    if (!has_access) {
+                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) == 0) {
+                            has_access = 1;
+                        } else if (file_acl_contains(file->read_access_users, file->read_access_count, ctx->username)) {
+                            has_access = 1;
+                        } else if (file_acl_contains(file->write_access_users, file->write_access_count, ctx->username)) {
+                            has_access = 1;
+                        }
+                    }
+
+                    if (!has_access) {
+                        continue;
+                    }
+
+                    if (request_details) {
+                        char word_buf[16];
+                        char char_buf[16];
+                        char accessed_buf[64];
+                        char modified_buf[64];
+
+                        // TODO: Replace placeholders once the storage server reports real stats.
+                        snprintf(word_buf, sizeof(word_buf), "%s", "N/A");
+                        snprintf(char_buf, sizeof(char_buf), "%s", "N/A");
+
+                        const char *last_access = (file->created > 0) ? format_time(file->created) : "N/A";
+                        const char *last_modified = (file->modified > 0) ? format_time(file->modified) : "N/A";
+                        snprintf(accessed_buf, sizeof(accessed_buf), "%s", last_access ? last_access : "N/A");
+                        snprintf(modified_buf, sizeof(modified_buf), "%s", last_modified ? last_modified : "N/A");
+
+                        const char *resp_fields[] = {
+                            RESP_OK_VIEW_L,
+                            file->filename,
+                            file->owner,
+                            word_buf,
+                            char_buf,
+                            accessed_buf,
+                            modified_buf
+                        };
+
+                        char *resp = protocol_build_message(resp_fields, 7);
+                        if (!resp) {
+                            log_message(LOG_WARNING, "NS", "Failed to build VIEW entry for %s.", file->filename);
+                            continue;
+                        }
+
+                        protocol_send_message(ctx->conn_fd, resp);
+                        free(resp);
+                    } else {
+                        const char *resp_fields[] = {RESP_OK_VIEW_L, file->filename};
+                        char *resp = protocol_build_message(resp_fields, 2);
+                        if (!resp) {
+                            log_message(LOG_WARNING, "NS", "Failed to build VIEW entry for %s.", file->filename);
+                            continue;
+                        }
+
+                        protocol_send_message(ctx->conn_fd, resp);
+                        free(resp);
+                    }
+                }
+                pthread_mutex_unlock(&ns->state_lock);
+
+                const char *end_fields[] = {RESP_OK_VIEW_END};
+                char *end_msg = protocol_build_message(end_fields, 1);
+                if (end_msg) {
+                    protocol_send_message(ctx->conn_fd, end_msg);
+                    free(end_msg);
+                } else {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build VIEW terminator.", ctx->peer_ip, ctx->peer_port);
+                }
+            }
         } else if (strcmp(command, MSG_CREATE) == 0) {
             // Create flow: validate request, register metadata locally, defer physical creation to storage server layer
             if (cmd_msg.field_count < 2) {
