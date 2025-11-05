@@ -1262,23 +1262,31 @@ int main(int argc, char *argv[]) {
     // Initialize logging
     log_init("name_server.log", LOG_INFO);
     
-    // Create Name Server
-    NameServer ns;
-    if (ns_init(&ns, port) != 0) {
+    // Create Name Server structure on the heap to avoid stack overflows
+    NameServer *ns = (NameServer *)calloc(1, sizeof(NameServer));
+    if (!ns) {
+        fprintf(stderr, "Failed to allocate Name Server\n");
+        return 1;
+    }
+
+    if (ns_init(ns, port) != 0) {
         fprintf(stderr, "Failed to initialize Name Server\n");
+        free(ns);
         return 1;
     }
     
     // Start server
     printf("Name Server starting on port %d...\n", port);
-    if (ns_start(&ns) != 0) {
+    if (ns_start(ns) != 0) {
         fprintf(stderr, "Server error\n");
-        ns_cleanup(&ns);
+        ns_cleanup(ns);
+        free(ns);
         return 1;
     }
     
     // Cleanup
-    ns_cleanup(&ns);
+    ns_cleanup(ns);
+    free(ns);
     log_cleanup();
     
     return 0;
