@@ -2,10 +2,1591 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
+
+static void ss_free_file_records(FileRecord *head);
+static void ss_load_existing_files(StorageServer *ss);
+static int ss_open_ns_socket(StorageServer *ss);
+static int ss_send_hello(StorageServer *ss);
+static int ss_emit_file_list(StorageServer *ss);
+static int ss_start_ns_thread(StorageServer *ss);
+static int ss_open_client_listener(StorageServer *ss);
+static void ss_send_ns_error(StorageServer *ss, int code, const char *message);
+static int ss_create_file(StorageServer *ss, const char *filename, const char *owner);
+static int ss_delete_file(StorageServer *ss, const char *filename);
+static char *ss_read_file_content(const char *path);
+static int ss_write_file_content(const char *path, const char *data);
+static int ss_check_read_access(FileRecord *rec, const char *user);
+static int ss_check_write_access(FileRecord *rec, const char *user);
+static int ss_get_sentence_bounds(const char *text, int sentence_index,
+                                  size_t *start_out, size_t *end_out);
+static int ss_apply_word_edit(WriteSession *session, int word_index, const char *content);
+
+typedef struct {
+    StorageServer *ss;
+} NsThreadArgs;
+
+typedef struct {
+    StorageServer *ss;
+    int client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+    int client_port;
+} ClientThreadArgs;
+
+static void ss_free_file_records(FileRecord *head) {
+    FileRecord *node = head;
+    while (node) {
+        FileRecord *next = node->next;
+        pthread_mutex_destroy(&node->file_lock);
+        free(node);
+        node = next;
+    }
+}
+
+static int build_path(char *buffer, size_t size, const char *base, const char *file) {
+    if (!buffer || !base || !file) {
+        return -1;
+    }
+
+    if (snprintf(buffer, size, "%s/%s", base, file) >= (int)size) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static void ss_init_file_record(FileRecord *rec, const char *filename, const char *base_path) {
+    memset(rec, 0, sizeof(FileRecord));
+    safe_strcpy(rec->filename, filename, sizeof(rec->filename));
+    build_path(rec->filepath, sizeof(rec->filepath), base_path, filename);
+
+    char meta_name[MAX_FILENAME_LENGTH + 8];
+    snprintf(meta_name, sizeof(meta_name), "%s%s", filename, SS_META_SUFFIX);
+    build_path(rec->metapath, sizeof(rec->metapath), base_path, meta_name);
+
+    char undo_name[MAX_FILENAME_LENGTH + 8];
+    snprintf(undo_name, sizeof(undo_name), "%s%s", filename, SS_UNDO_SUFFIX);
+    build_path(rec->undopath, sizeof(rec->undopath), base_path, undo_name);
+
+    pthread_mutex_init(&rec->file_lock, NULL);
+    rec->locked_sentence_index = -1;
+}
+
+static int ss_load_metadata(FileRecord *rec) {
+    FILE *fp = fopen(rec->metapath, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    rec->read_count = 0;
+    rec->write_count = 0;
+    rec->undo_available = 0;
+    rec->sentence_locked = 0;
+    rec->locked_sentence_index = -1;
+    rec->lock_owner[0] = '\0';
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        trim_string(line);
+        if (strncmp(line, "OWNER=", 6) == 0) {
+            safe_strcpy(rec->owner, line + 6, sizeof(rec->owner));
+        } else if (strncmp(line, "READ=", 5) == 0) {
+            char *token = strtok(line + 5, ",");
+            rec->read_count = 0;
+            while (token && rec->read_count < SS_MAX_USERS_PER_FILE) {
+                trim_string(token);
+                if (strlen(token) > 0) {
+                    safe_strcpy(rec->read_users[rec->read_count], token, MAX_USERNAME_LENGTH);
+                    rec->read_count++;
+                }
+                token = strtok(NULL, ",");
+            }
+        } else if (strncmp(line, "WRITE=", 6) == 0) {
+            char *token = strtok(line + 6, ",");
+            rec->write_count = 0;
+            while (token && rec->write_count < SS_MAX_USERS_PER_FILE) {
+                trim_string(token);
+                if (strlen(token) > 0) {
+                    safe_strcpy(rec->write_users[rec->write_count], token, MAX_USERNAME_LENGTH);
+                    rec->write_count++;
+                }
+                token = strtok(NULL, ",");
+            }
+        } else if (strncmp(line, "CREATED=", 8) == 0) {
+            rec->created = (time_t)atoll(line + 8);
+        } else if (strncmp(line, "MODIFIED=", 9) == 0) {
+            rec->modified = (time_t)atoll(line + 9);
+        } else if (strncmp(line, "LAST_ACCESS=", 12) == 0) {
+            rec->last_access = (time_t)atoll(line + 12);
+        } else if (strncmp(line, "LAST_USER=", 10) == 0) {
+            safe_strcpy(rec->last_access_user, line + 10, sizeof(rec->last_access_user));
+        } else if (strncmp(line, "UNDO=", 5) == 0) {
+            rec->undo_available = atoi(line + 5);
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+static int ss_write_metadata(FileRecord *rec) {
+    FILE *fp = fopen(rec->metapath, "w");
+    if (!fp) {
+        return -1;
+    }
+
+    fprintf(fp, "OWNER=%s\n", rec->owner);
+    fprintf(fp, "CREATED=%lld\n", (long long)rec->created);
+    fprintf(fp, "MODIFIED=%lld\n", (long long)rec->modified);
+    fprintf(fp, "LAST_ACCESS=%lld\n", (long long)rec->last_access);
+    fprintf(fp, "LAST_USER=%s\n", rec->last_access_user);
+    fprintf(fp, "UNDO=%d\n", rec->undo_available);
+
+    fprintf(fp, "READ=");
+    for (int i = 0; i < rec->read_count; i++) {
+        fprintf(fp, "%s%s", rec->read_users[i], (i + 1 < rec->read_count) ? "," : "");
+    }
+    fprintf(fp, "\n");
+
+    fprintf(fp, "WRITE=");
+    for (int i = 0; i < rec->write_count; i++) {
+        fprintf(fp, "%s%s", rec->write_users[i], (i + 1 < rec->write_count) ? "," : "");
+    }
+    fprintf(fp, "\n");
+
+    fclose(fp);
+    return 0;
+}
+
+static FileRecord *ss_find_file(StorageServer *ss, const char *filename) {
+    FileRecord *node = ss->files;
+    while (node) {
+        if (strncmp(node->filename, filename, sizeof(node->filename)) == 0) {
+            return node;
+        }
+        node = node->next;
+    }
+    return NULL;
+}
+
+static int ss_add_file_record(StorageServer *ss, const char *filename) {
+    FileRecord *rec = (FileRecord *)safe_malloc(sizeof(FileRecord));
+    if (!rec) {
+        return -1;
+    }
+
+    ss_init_file_record(rec, filename, ss->storage_path);
+    if (ss_load_metadata(rec) != 0) {
+        rec->created = get_current_time();
+        rec->modified = rec->created;
+        rec->last_access = rec->created;
+        rec->undo_available = 0;
+        rec->read_count = 0;
+        rec->write_count = 0;
+        ss_write_metadata(rec);
+    }
+
+    rec->next = ss->files;
+    ss->files = rec;
+    return 0;
+}
+
+static void ss_load_existing_files(StorageServer *ss) {
+    DIR *dir = opendir(ss->storage_path);
+    if (!dir) {
+        log_message(LOG_ERROR, "SS", "Failed to open storage path %s: %s", ss->storage_path, strerror(errno));
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+
+        const char *name = entry->d_name;
+        size_t len = strlen(name);
+        if (len == 0) {
+            continue;
+        }
+
+        if (len > strlen(SS_META_SUFFIX) &&
+            strcmp(name + len - strlen(SS_META_SUFFIX), SS_META_SUFFIX) == 0) {
+            continue;
+        }
+
+        if (len > strlen(SS_UNDO_SUFFIX) &&
+            strcmp(name + len - strlen(SS_UNDO_SUFFIX), SS_UNDO_SUFFIX) == 0) {
+            continue;
+        }
+
+        ss_add_file_record(ss, name);
+    }
+
+    closedir(dir);
+}
+
+static void ss_touch_file_metadata(FileRecord *rec, const char *username, int update_modified) {
+    time_t now = get_current_time();
+    rec->last_access = now;
+    if (username) {
+        safe_strcpy(rec->last_access_user, username, sizeof(rec->last_access_user));
+    }
+    if (update_modified) {
+        rec->modified = now;
+    }
+    ss_write_metadata(rec);
+}
+
+static WriteSession *ss_find_session(StorageServer *ss, int client_fd) {
+    WriteSession *node = ss->sessions;
+    while (node) {
+        if (node->client_fd == client_fd) {
+            return node;
+        }
+        node = node->next;
+    }
+    return NULL;
+}
+
+static void ss_free_session(WriteSession *session) {
+    if (!session) {
+        return;
+    }
+    if (session->file_snapshot) {
+        free(session->file_snapshot);
+    }
+    if (session->sentence_working) {
+        free(session->sentence_working);
+    }
+    free(session);
+}
+
+static WriteSession *ss_detach_session(StorageServer *ss, int client_fd) {
+    WriteSession *prev = NULL;
+    WriteSession *node = ss->sessions;
+    while (node) {
+        if (node->client_fd == client_fd) {
+            if (prev) {
+                prev->next = node->next;
+            } else {
+                ss->sessions = node->next;
+            }
+            node->next = NULL;
+            return node;
+        }
+        prev = node;
+        node = node->next;
+    }
+    return NULL;
+}
+
+static void ss_abort_session(StorageServer *ss, int client_fd) {
+    pthread_mutex_lock(&ss->sessions_lock);
+    WriteSession *session = ss_detach_session(ss, client_fd);
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    if (!session) {
+        return;
+    }
+
+    FileRecord *rec = session->file;
+    if (rec) {
+        pthread_mutex_lock(&rec->file_lock);
+        if (rec->sentence_locked && strncmp(rec->lock_owner, session->username, MAX_USERNAME_LENGTH) == 0) {
+            rec->sentence_locked = 0;
+            rec->locked_sentence_index = -1;
+            rec->lock_owner[0] = '\0';
+        }
+        pthread_mutex_unlock(&rec->file_lock);
+    }
+
+    ss_free_session(session);
+}
+
+static WriteSession *ss_create_session(StorageServer *ss, int client_fd, FileRecord *rec,
+                                       const char *username, int sentence_index,
+                                       size_t start_offset, size_t end_offset,
+                                       const char *file_snapshot, const char *sentence_text) {
+    WriteSession *session = (WriteSession *)safe_malloc(sizeof(WriteSession));
+    if (!session) {
+        return NULL;
+    }
+    memset(session, 0, sizeof(WriteSession));
+    session->client_fd = client_fd;
+    session->file = rec;
+    session->sentence_index = sentence_index;
+    safe_strcpy(session->username, username, sizeof(session->username));
+    session->sentence_start = start_offset;
+    session->sentence_end = end_offset;
+    if (file_snapshot) {
+        session->file_snapshot = strdup(file_snapshot);
+        if (!session->file_snapshot) {
+            free(session);
+            return NULL;
+        }
+    }
+    if (sentence_text) {
+        session->sentence_working = strdup(sentence_text);
+        if (!session->sentence_working) {
+            free(session->file_snapshot);
+            free(session);
+            return NULL;
+        }
+    }
+    session->next = ss->sessions;
+    ss->sessions = session;
+    return session;
+}
+
+static int ss_open_ns_socket(StorageServer *ss) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        log_message(LOG_ERROR, "SS", "Failed to create NS socket: %s", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(ss->ns_port);
+    if (inet_pton(AF_INET, ss->ns_ip, &addr.sin_addr) != 1) {
+        log_message(LOG_ERROR, "SS", "Invalid NS IP: %s", ss->ns_ip);
+        close(sockfd);
+        return -1;
+    }
+
+    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_message(LOG_ERROR, "SS", "Failed to connect to NS %s:%d: %s", ss->ns_ip, ss->ns_port, strerror(errno));
+        close(sockfd);
+        return -1;
+    }
+
+    ss->ns_sockfd = sockfd;
+    return 0;
+}
+
+static int ss_send_hello(StorageServer *ss) {
+    char ns_port_buf[16];
+    snprintf(ns_port_buf, sizeof(ns_port_buf), "%d", ss->ns_port);
+    char client_port_buf[16];
+    snprintf(client_port_buf, sizeof(client_port_buf), "%d", ss->client_port);
+
+    const char *fields[] = {MSG_HELLO_SS, ss->ns_ip, ns_port_buf, ss->client_ip, client_port_buf};
+    char *msg = protocol_build_message(fields, 5);
+    if (!msg) {
+        return -1;
+    }
+
+    if (protocol_send_message(ss->ns_sockfd, msg) < 0) {
+        free(msg);
+        log_message(LOG_ERROR, "SS", "Failed to send HELLO_SS");
+        return -1;
+    }
+    free(msg);
+
+    char *resp_raw = protocol_receive_message(ss->ns_sockfd);
+    if (!resp_raw) {
+        log_message(LOG_ERROR, "SS", "No response from NS during registration");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    if (protocol_parse_message(resp_raw, &resp) != 0 || resp.field_count == 0) {
+        free(resp_raw);
+        return -1;
+    }
+
+    int ok = (strcmp(resp.fields[0], RESP_OK) == 0);
+    protocol_free_message(&resp);
+    free(resp_raw);
+    return ok ? 0 : -1;
+}
+
+static int ss_emit_file_list(StorageServer *ss) {
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *node = ss->files;
+    while (node) {
+        const char *fields[] = {MSG_SS_HAS_FILE, node->filename};
+        char *msg = protocol_build_message(fields, 2);
+        if (!msg) {
+            pthread_mutex_unlock(&ss->files_lock);
+            return -1;
+        }
+        if (protocol_send_message(ss->ns_sockfd, msg) < 0) {
+            free(msg);
+            pthread_mutex_unlock(&ss->files_lock);
+            return -1;
+        }
+        free(msg);
+        node = node->next;
+    }
+    pthread_mutex_unlock(&ss->files_lock);
+
+    const char *done_fields[] = {MSG_SS_FILES_DONE};
+    char *done_msg = protocol_build_message(done_fields, 1);
+    if (!done_msg) {
+        return -1;
+    }
+    if (protocol_send_message(ss->ns_sockfd, done_msg) < 0) {
+        free(done_msg);
+        return -1;
+    }
+    free(done_msg);
+    return 0;
+}
+
+static void *ns_control_loop(void *arg) {
+    NsThreadArgs *params = (NsThreadArgs *)arg;
+    StorageServer *ss = params->ss;
+    free(params);
+
+    while (ss->running) {
+        char *raw = protocol_receive_message(ss->ns_sockfd);
+        if (!raw) {
+            log_message(LOG_WARNING, "SS", "Lost connection to Name Server");
+            ss->running = 0;
+            if (ss->client_listen_fd >= 0) {
+                shutdown(ss->client_listen_fd, SHUT_RDWR);
+            }
+            break;
+        }
+
+        ProtocolMessage msg;
+        if (protocol_parse_message(raw, &msg) != 0 || msg.field_count == 0) {
+            free(raw);
+            continue;
+        }
+
+        const char *command = msg.fields[0];
+
+        if (strcmp(command, MSG_CREATE_FILE) == 0) {
+            if (msg.field_count < 3) {
+                ss_send_ns_error(ss, ERR_INVALID_REQUEST, "CREATE_FILE missing fields");
+            } else {
+                const char *filename = msg.fields[1];
+                const char *owner = msg.fields[2];
+                if (!validate_filename(filename) || !validate_username(owner)) {
+                    ss_send_ns_error(ss, ERR_INVALID_REQUEST, "Invalid filename or owner");
+                } else if (ss_create_file(ss, filename, owner) != 0) {
+                    ss_send_ns_error(ss, ERR_FILE_EXISTS, "File already exists");
+                } else {
+                    const char *fields[] = {RESP_OK_CREATE, filename};
+                    char *resp = protocol_build_message(fields, 2);
+                    if (resp) {
+                        protocol_send_message(ss->ns_sockfd, resp);
+                        free(resp);
+                    }
+                    log_message(LOG_INFO, "SS", "Created file %s for owner %s", filename, owner);
+                }
+            }
+        } else if (strcmp(command, MSG_DELETE_FILE) == 0) {
+            if (msg.field_count < 2) {
+                ss_send_ns_error(ss, ERR_INVALID_REQUEST, "DELETE_FILE missing filename");
+            } else {
+                const char *filename = msg.fields[1];
+                if (!validate_filename(filename)) {
+                    ss_send_ns_error(ss, ERR_INVALID_REQUEST, "Invalid filename");
+                } else if (ss_delete_file(ss, filename) != 0) {
+                    ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "File not found");
+                } else {
+                    const char *fields[] = {RESP_OK_DELETE, filename};
+                    char *resp = protocol_build_message(fields, 2);
+                    if (resp) {
+                        protocol_send_message(ss->ns_sockfd, resp);
+                        free(resp);
+                    }
+                    log_message(LOG_INFO, "SS", "Deleted file %s", filename);
+                }
+            }
+        } else if (strcmp(command, MSG_GET_STATS) == 0) {
+            if (msg.field_count < 2) {
+                ss_send_ns_error(ss, ERR_INVALID_REQUEST, "GET_STATS missing filename");
+            } else {
+                const char *filename = msg.fields[1];
+                pthread_mutex_lock(&ss->files_lock);
+                FileRecord *rec = ss_find_file(ss, filename);
+                if (!rec) {
+                    pthread_mutex_unlock(&ss->files_lock);
+                    ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "Stats target missing");
+                } else {
+                    pthread_mutex_lock(&rec->file_lock);
+                    pthread_mutex_unlock(&ss->files_lock);
+
+                    long size = get_file_size(rec->filepath);
+                    char *content = ss_read_file_content(rec->filepath);
+                    int words = content ? count_words(content) : 0;
+                    int chars = content ? count_chars(content) : 0;
+
+                    char size_buf[32];
+                    snprintf(size_buf, sizeof(size_buf), "%ld", size >= 0 ? size : 0);
+                    char words_buf[32];
+                    snprintf(words_buf, sizeof(words_buf), "%d", words);
+                    char chars_buf[32];
+                    snprintf(chars_buf, sizeof(chars_buf), "%d", chars);
+
+                    char created_buf[32], modified_buf[32], access_buf[32];
+                    snprintf(created_buf, sizeof(created_buf), "%lld", (long long)rec->created);
+                    snprintf(modified_buf, sizeof(modified_buf), "%lld", (long long)rec->modified);
+                    snprintf(access_buf, sizeof(access_buf), "%lld", (long long)rec->last_access);
+
+                    const char *fields[] = {
+                        RESP_OK_STATS,
+                        rec->filename,
+                        rec->owner,
+                        size_buf,
+                        words_buf,
+                        chars_buf,
+                        created_buf,
+                        modified_buf,
+                        access_buf,
+                        rec->last_access_user
+                    };
+                    char *resp = protocol_build_message(fields, 10);
+                    if (resp) {
+                        protocol_send_message(ss->ns_sockfd, resp);
+                        free(resp);
+                    }
+
+                    if (content) {
+                        free(content);
+                    }
+
+                    pthread_mutex_unlock(&rec->file_lock);
+                }
+            }
+        } else if (strcmp(command, MSG_GET_CONTENT) == 0) {
+            if (msg.field_count < 2) {
+                ss_send_ns_error(ss, ERR_INVALID_REQUEST, "GET_CONTENT missing filename");
+            } else {
+                const char *filename = msg.fields[1];
+                pthread_mutex_lock(&ss->files_lock);
+                FileRecord *rec = ss_find_file(ss, filename);
+                if (!rec) {
+                    pthread_mutex_unlock(&ss->files_lock);
+                    ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "Content file missing");
+                } else {
+                    pthread_mutex_lock(&rec->file_lock);
+                    pthread_mutex_unlock(&ss->files_lock);
+
+                    char *content = ss_read_file_content(rec->filepath);
+                    if (!content) {
+                        pthread_mutex_unlock(&rec->file_lock);
+                        ss_send_ns_error(ss, ERR_INTERNAL_ERROR, "Failed to read file");
+                    } else {
+                        const char *fields[] = {RESP_OK_CONTENT, rec->filename, content};
+                        char *resp = protocol_build_message(fields, 3);
+                        if (resp) {
+                            protocol_send_message(ss->ns_sockfd, resp);
+                            free(resp);
+                        }
+                        free(content);
+                        pthread_mutex_unlock(&rec->file_lock);
+                    }
+                }
+            }
+        } else {
+            log_message(LOG_WARNING, "SS", "Unknown NS command: %s", command);
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    return NULL;
+}
+
+static int ss_start_ns_thread(StorageServer *ss) {
+    NsThreadArgs *args = (NsThreadArgs *)safe_malloc(sizeof(NsThreadArgs));
+    if (!args) {
+        return -1;
+    }
+    args->ss = ss;
+    if (pthread_create(&ss->ns_thread, NULL, ns_control_loop, args) != 0) {
+        log_message(LOG_ERROR, "SS", "Failed to start NS control thread");
+        free(args);
+        return -1;
+    }
+    ss->ns_thread_active = 1;
+    ss->ns_thread_started = 1;
+    return 0;
+}
+
+static int ss_open_client_listener(StorageServer *ss) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        log_message(LOG_ERROR, "SS", "Failed to create client listener: %s", strerror(errno));
+        return -1;
+    }
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr(ss->client_ip);
+    addr.sin_port = htons(ss->client_port);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_message(LOG_ERROR, "SS", "Bind failed on %s:%d: %s", ss->client_ip, ss->client_port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (listen(fd, SOMAXCONN) < 0) {
+        log_message(LOG_ERROR, "SS", "Listen failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    ss->client_listen_fd = fd;
+    return 0;
+}
+
+static int parse_int(const char *text, int *out_value) {
+    if (!text || !out_value) {
+        return -1;
+    }
+    char *endptr = NULL;
+    long val = strtol(text, &endptr, 10);
+    if (!endptr || *endptr != '\0') {
+        return -1;
+    }
+    if (val < INT_MIN || val > INT_MAX) {
+        return -1;
+    }
+    *out_value = (int)val;
+    return 0;
+}
+
+static int ss_check_read_access(FileRecord *rec, const char *user) {
+    if (!rec || !user) {
+        return 0;
+    }
+    if (rec->owner[0] != '\0' && strncmp(rec->owner, user, MAX_USERNAME_LENGTH) == 0) {
+        return 1;
+    }
+    for (int i = 0; i < rec->read_count; i++) {
+        if (strncmp(rec->read_users[i], user, MAX_USERNAME_LENGTH) == 0) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < rec->write_count; i++) {
+        if (strncmp(rec->write_users[i], user, MAX_USERNAME_LENGTH) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ss_check_write_access(FileRecord *rec, const char *user) {
+    if (!rec || !user) {
+        return 0;
+    }
+    if (rec->owner[0] != '\0' && strncmp(rec->owner, user, MAX_USERNAME_LENGTH) == 0) {
+        return 1;
+    }
+    for (int i = 0; i < rec->write_count; i++) {
+        if (strncmp(rec->write_users[i], user, MAX_USERNAME_LENGTH) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static char *ss_read_file_content(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return NULL;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long len = ftell(fp);
+    if (len < 0) {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+
+    char *buffer = (char *)safe_malloc((size_t)len + 1);
+    if (!buffer) {
+        fclose(fp);
+        return NULL;
+    }
+
+    size_t read = fread(buffer, 1, (size_t)len, fp);
+    buffer[read] = '\0';
+    fclose(fp);
+    return buffer;
+}
+
+static int ss_write_file_content(const char *path, const char *data) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        return -1;
+    }
+    size_t len = strlen(data);
+    size_t written = fwrite(data, 1, len, fp);
+    fclose(fp);
+    return (written == len) ? 0 : -1;
+}
+
+static void ss_send_ns_error(StorageServer *ss, int code, const char *message) {
+    char *err = protocol_build_error(code, message);
+    if (!err) {
+        return;
+    }
+    protocol_send_message(ss->ns_sockfd, err);
+    free(err);
+}
+
+static int ss_create_file(StorageServer *ss, const char *filename, const char *owner) {
+    pthread_mutex_lock(&ss->files_lock);
+    if (ss_find_file(ss, filename)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        return -1;
+    }
+
+    FileRecord *rec = (FileRecord *)safe_malloc(sizeof(FileRecord));
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        return -1;
+    }
+
+    ss_init_file_record(rec, filename, ss->storage_path);
+    if (owner) {
+        safe_strcpy(rec->owner, owner, sizeof(rec->owner));
+        safe_strcpy(rec->last_access_user, owner, sizeof(rec->last_access_user));
+    }
+    rec->created = get_current_time();
+    rec->modified = rec->created;
+    rec->last_access = rec->created;
+    rec->undo_available = 0;
+    rec->read_count = 0;
+    rec->write_count = 0;
+
+    FILE *fp = fopen(rec->filepath, "wb");
+    if (!fp) {
+        pthread_mutex_destroy(&rec->file_lock);
+        free(rec);
+        pthread_mutex_unlock(&ss->files_lock);
+        return -1;
+    }
+    fclose(fp);
+
+    ss_write_metadata(rec);
+
+    rec->next = ss->files;
+    ss->files = rec;
+    pthread_mutex_unlock(&ss->files_lock);
+    return 0;
+}
+
+static int ss_delete_file(StorageServer *ss, const char *filename) {
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *prev = NULL;
+    FileRecord *node = ss->files;
+    while (node) {
+        if (strncmp(node->filename, filename, sizeof(node->filename)) == 0) {
+            break;
+        }
+        prev = node;
+        node = node->next;
+    }
+
+    if (!node) {
+        pthread_mutex_unlock(&ss->files_lock);
+        return -1;
+    }
+
+    unlink(node->filepath);
+    unlink(node->metapath);
+    unlink(node->undopath);
+
+    if (prev) {
+        prev->next = node->next;
+    } else {
+        ss->files = node->next;
+    }
+
+    pthread_mutex_unlock(&ss->files_lock);
+    pthread_mutex_destroy(&node->file_lock);
+    free(node);
+    return 0;
+}
+
+static void send_error_response(int fd, int code, const char *message) {
+    char *err = protocol_build_error(code, message);
+    if (!err) {
+        return;
+    }
+    protocol_send_message(fd, err);
+    free(err);
+}
+
+static void send_simple_ok(int fd, const char *detail) {
+    if (detail) {
+        const char *fields[] = {RESP_OK, detail};
+        char *msg = protocol_build_message(fields, 2);
+        if (!msg) {
+            return;
+        }
+        protocol_send_message(fd, msg);
+        free(msg);
+    } else {
+        const char *fields[] = {RESP_OK};
+        char *msg = protocol_build_message(fields, 1);
+        if (!msg) {
+            return;
+        }
+        protocol_send_message(fd, msg);
+        free(msg);
+    }
+}
+
+static int split_words(const char *text, char ***words_out, int *count_out) {
+    if (!words_out || !count_out) {
+        return -1;
+    }
+    *words_out = NULL;
+    *count_out = 0;
+
+    if (!text) {
+        return 0;
+    }
+
+    const char *ptr = text;
+    while (*ptr) {
+        while (*ptr && isspace((unsigned char)*ptr)) {
+            ptr++;
+        }
+        if (!*ptr) {
+            break;
+        }
+        const char *start = ptr;
+        while (*ptr && !isspace((unsigned char)*ptr)) {
+            ptr++;
+        }
+        size_t len = (size_t)(ptr - start);
+        if (len == 0) {
+            continue;
+        }
+
+        char *word = (char *)safe_malloc(len + 1);
+        if (!word) {
+            for (int i = 0; i < *count_out; i++) {
+                free((*words_out)[i]);
+            }
+            free(*words_out);
+            *words_out = NULL;
+            *count_out = 0;
+            return -1;
+        }
+        memcpy(word, start, len);
+        word[len] = '\0';
+
+        char **new_array = (char **)realloc(*words_out, (size_t)(*count_out + 1) * sizeof(char *));
+        if (!new_array) {
+            free(word);
+            for (int i = 0; i < *count_out; i++) {
+                free((*words_out)[i]);
+            }
+            free(*words_out);
+            *words_out = NULL;
+            *count_out = 0;
+            return -1;
+        }
+        *words_out = new_array;
+        (*words_out)[*count_out] = word;
+        (*count_out)++;
+    }
+
+    return 0;
+}
+
+static void free_words(char **words, int count) {
+    if (!words) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(words[i]);
+    }
+    free(words);
+}
+
+static char *join_words(char **words, int count, char delimiter_char) {
+    size_t total = 0;
+    for (int i = 0; i < count; i++) {
+        if (words[i]) {
+            total += strlen(words[i]);
+        }
+        if (i + 1 < count) {
+            total++; // space
+        }
+    }
+    if (delimiter_char) {
+        total++;
+    }
+    char *result = (char *)safe_malloc(total + 1);
+    if (!result) {
+        return NULL;
+    }
+    result[0] = '\0';
+    for (int i = 0; i < count; i++) {
+        if (i > 0) {
+            safe_strcat(result, " ", total + 1);
+        }
+        if (words[i]) {
+            safe_strcat(result, words[i], total + 1);
+        }
+    }
+    if (delimiter_char) {
+        size_t len = strlen(result);
+        result[len] = delimiter_char;
+        result[len + 1] = '\0';
+    }
+    return result;
+}
+
+static int ss_get_sentence_bounds(const char *text, int sentence_index,
+                                  size_t *start_out, size_t *end_out) {
+    if (!text || sentence_index < 0 || !start_out || !end_out) {
+        return -1;
+    }
+
+    const char *cursor = text;
+    int current = 0;
+
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+
+    const char *sentence_start = cursor;
+
+    if (*sentence_start == '\0') {
+        if (sentence_index == 0) {
+            *start_out = (size_t)(sentence_start - text);
+            *end_out = *start_out;
+            return 0;
+        }
+        return -1;
+    }
+
+    while (*cursor) {
+        if (is_sentence_delimiter(*cursor)) {
+            const char *sentence_end = cursor + 1;
+            if (current == sentence_index) {
+                *start_out = (size_t)(sentence_start - text);
+                *end_out = (size_t)(sentence_end - text);
+                return 0;
+            }
+
+            current++;
+            cursor = sentence_end;
+            while (*cursor && isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            sentence_start = cursor;
+            continue;
+        }
+        cursor++;
+    }
+
+    if (current == sentence_index && sentence_start <= cursor) {
+        *start_out = (size_t)(sentence_start - text);
+        *end_out = (size_t)(cursor - text);
+        return 0;
+    }
+
+    return -1;
+}
+
+static int ss_apply_word_edit(WriteSession *session, int word_index, const char *content) {
+    if (!session || word_index < 0 || !content) {
+        return -1;
+    }
+
+    const char *current_sentence = session->sentence_working ? session->sentence_working : "";
+    char *buffer = strdup(current_sentence);
+    if (!buffer) {
+        return -1;
+    }
+
+    size_t len = strlen(buffer);
+    while (len > 0 && isspace((unsigned char)buffer[len - 1])) {
+        buffer[len - 1] = '\0';
+        len--;
+    }
+
+    char delimiter = '\0';
+    if (len > 0 && is_sentence_delimiter(buffer[len - 1])) {
+        delimiter = buffer[len - 1];
+        buffer[len - 1] = '\0';
+    }
+
+    char **words = NULL;
+    int word_count = 0;
+    if (split_words(buffer, &words, &word_count) != 0) {
+        free(buffer);
+        return -1;
+    }
+
+    free(buffer);
+
+    if (word_index > word_count) {
+        free_words(words, word_count);
+        return -1;
+    }
+
+    if (word_index < word_count) {
+        free(words[word_index]);
+        for (int i = word_index; i < word_count - 1; i++) {
+            words[i] = words[i + 1];
+        }
+        word_count--;
+    }
+
+    char **new_words = NULL;
+    int new_count = 0;
+    if (split_words(content, &new_words, &new_count) != 0) {
+        free_words(words, word_count);
+        return -1;
+    }
+
+    if (new_count > 0) {
+        char **expanded = (char **)realloc(words, (size_t)(word_count + new_count) * sizeof(char *));
+        if (!expanded) {
+            free_words(words, word_count);
+            free_words(new_words, new_count);
+            return -1;
+        }
+        words = expanded;
+        for (int i = word_count - 1; i >= word_index; i--) {
+            words[i + new_count] = words[i];
+        }
+        for (int i = 0; i < new_count; i++) {
+            words[word_index + i] = new_words[i];
+        }
+        word_count += new_count;
+        free(new_words);
+    } else {
+        free(new_words);
+    }
+
+    char *joined = join_words(words, word_count, delimiter);
+    free_words(words, word_count);
+    if (!joined) {
+        return -1;
+    }
+
+    if (session->sentence_working) {
+        free(session->sentence_working);
+    }
+    session->sentence_working = joined;
+    return 0;
+}
+
+static void handle_client_read(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 3) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_READ");
+        return;
+    }
+
+    const char *username = msg->fields[1];
+    const char *filename = msg->fields[2];
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, filename);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_FILE_NOT_FOUND, "File not found");
+        return;
+    }
+
+    if (!ss_check_read_access(rec, username)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_PERMISSION_DENIED, "No read access");
+        return;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    char *content = ss_read_file_content(rec->filepath);
+    if (!content) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to read file");
+        return;
+    }
+
+    const char *start_fields[] = {RESP_OK_READ_START, rec->filename};
+    char *start_msg = protocol_build_message(start_fields, 2);
+    if (start_msg) {
+        protocol_send_message(fd, start_msg);
+        free(start_msg);
+    }
+
+    const char *content_fields[] = {RESP_OK_CONTENT, content};
+    char *content_msg = protocol_build_message(content_fields, 2);
+    if (content_msg) {
+        protocol_send_message(fd, content_msg);
+        free(content_msg);
+    }
+
+    const char *end_fields[] = {RESP_OK_READ_END};
+    char *end_msg = protocol_build_message(end_fields, 1);
+    if (end_msg) {
+        protocol_send_message(fd, end_msg);
+        free(end_msg);
+    }
+
+    ss_touch_file_metadata(rec, username, 0);
+    pthread_mutex_unlock(&rec->file_lock);
+    free(content);
+}
+
+static void handle_client_stream(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 3) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_STREAM");
+        return;
+    }
+
+    const char *username = msg->fields[1];
+    const char *filename = msg->fields[2];
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, filename);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_FILE_NOT_FOUND, "File not found");
+        return;
+    }
+
+    if (!ss_check_read_access(rec, username)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_PERMISSION_DENIED, "No read access");
+        return;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    char *content = ss_read_file_content(rec->filepath);
+    if (!content) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to read file");
+        return;
+    }
+
+    const char *start_fields[] = {RESP_OK_STREAM, rec->filename};
+    char *start_msg = protocol_build_message(start_fields, 2);
+    if (start_msg) {
+        protocol_send_message(fd, start_msg);
+        free(start_msg);
+    }
+
+    const char *cursor = content;
+    while (*cursor) {
+        while (*cursor && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+
+        const char *word_start = cursor;
+        while (*cursor && !isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        size_t word_len = (size_t)(cursor - word_start);
+        if (word_len == 0) {
+            continue;
+        }
+
+        char *word = (char *)safe_malloc(word_len + 1);
+        if (!word) {
+            break;
+        }
+        memcpy(word, word_start, word_len);
+        word[word_len] = '\0';
+
+        const char *word_fields[] = {RESP_OK_CONTENT, word};
+        char *word_msg = protocol_build_message(word_fields, 2);
+        if (word_msg) {
+            protocol_send_message(fd, word_msg);
+            free(word_msg);
+        }
+        free(word);
+        usleep(100000);
+    }
+
+    const char *end_fields[] = {RESP_OK_STREAM_END};
+    char *end_msg = protocol_build_message(end_fields, 1);
+    if (end_msg) {
+        protocol_send_message(fd, end_msg);
+        free(end_msg);
+    }
+
+    ss_touch_file_metadata(rec, username, 0);
+    pthread_mutex_unlock(&rec->file_lock);
+    free(content);
+}
+
+static void handle_client_write_lock(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 4) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_WRITE_LOCK");
+        return;
+    }
+
+    const char *username = msg->fields[1];
+    const char *filename = msg->fields[2];
+    int sentence_index = 0;
+    if (parse_int(msg->fields[3], &sentence_index) != 0 || sentence_index < 0) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Invalid sentence index");
+        return;
+    }
+
+    ss_abort_session(ss, fd);
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, filename);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_FILE_NOT_FOUND, "File not found");
+        return;
+    }
+
+    if (!ss_check_write_access(rec, username)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_PERMISSION_DENIED, "No write access");
+        return;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    if (rec->sentence_locked && strncmp(rec->lock_owner, username, MAX_USERNAME_LENGTH) != 0) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_SENTENCE_LOCKED, "Sentence already locked");
+        return;
+    }
+
+    char *file_data = ss_read_file_content(rec->filepath);
+    if (!file_data) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to read file");
+        return;
+    }
+
+    size_t start = 0, end = 0;
+    int bound_status = ss_get_sentence_bounds(file_data, sentence_index, &start, &end);
+    if (bound_status < 0) {
+        free(file_data);
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INVALID_REQUEST, "Sentence index out of range");
+        return;
+    }
+
+    char *sentence_text = NULL;
+    if (end > start) {
+        size_t len = end - start;
+        sentence_text = (char *)safe_malloc(len + 1);
+        if (!sentence_text) {
+            free(file_data);
+            pthread_mutex_unlock(&rec->file_lock);
+            send_error_response(fd, ERR_INTERNAL_ERROR, "Memory allocation failed");
+            return;
+        }
+        memcpy(sentence_text, file_data + start, len);
+        sentence_text[len] = '\0';
+    } else {
+        sentence_text = strdup("");
+    }
+
+    pthread_mutex_lock(&ss->sessions_lock);
+    WriteSession *session = ss_create_session(ss, fd, rec, username, sentence_index, start, end, file_data, sentence_text);
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    free(file_data);
+    if (sentence_text) {
+        free(sentence_text);
+    }
+
+    if (!session) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to create write session");
+        return;
+    }
+
+    rec->sentence_locked = 1;
+    rec->locked_sentence_index = sentence_index;
+    safe_strcpy(rec->lock_owner, username, sizeof(rec->lock_owner));
+
+    const char *lock_fields[] = {RESP_OK_LOCKED, rec->filename, msg->fields[3]};
+    char *lock_msg = protocol_build_message(lock_fields, 3);
+    if (lock_msg) {
+        protocol_send_message(fd, lock_msg);
+        free(lock_msg);
+    }
+
+    if (session->sentence_working) {
+        const char *sent_fields[] = {RESP_OK_CONTENT, session->sentence_working};
+        char *sent_msg = protocol_build_message(sent_fields, 2);
+        if (sent_msg) {
+            protocol_send_message(fd, sent_msg);
+            free(sent_msg);
+        }
+    }
+
+    pthread_mutex_unlock(&rec->file_lock);
+}
+
+static void handle_client_write_data(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 3) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in WRITE_DATA");
+        return;
+    }
+
+    int word_index = 0;
+    if (parse_int(msg->fields[1], &word_index) != 0 || word_index < 0) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Invalid word index");
+        return;
+    }
+
+    pthread_mutex_lock(&ss->sessions_lock);
+    WriteSession *session = ss_find_session(ss, fd);
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    if (!session) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "No active WRITE session");
+        return;
+    }
+
+    if (ss_apply_word_edit(session, word_index, msg->fields[2]) != 0) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Failed to apply edit");
+        return;
+    }
+
+    send_simple_ok(fd, "WRITE_DATA applied");
+}
+
+static void handle_client_etirw(StorageServer *ss, int fd) {
+    pthread_mutex_lock(&ss->sessions_lock);
+    WriteSession *session = ss_find_session(ss, fd);
+    if (!session) {
+        pthread_mutex_unlock(&ss->sessions_lock);
+        send_error_response(fd, ERR_INVALID_REQUEST, "No active WRITE session");
+        return;
+    }
+
+    FileRecord *rec = session->file;
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    pthread_mutex_lock(&rec->file_lock);
+
+    if (!rec->sentence_locked || strncmp(rec->lock_owner, session->username, MAX_USERNAME_LENGTH) != 0) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INVALID_REQUEST, "Sentence lock lost");
+        return;
+    }
+
+    const char *snapshot = session->file_snapshot ? session->file_snapshot : "";
+    const char *replacement = session->sentence_working ? session->sentence_working : "";
+
+    char username_copy[MAX_USERNAME_LENGTH];
+    safe_strcpy(username_copy, session->username, sizeof(username_copy));
+
+    size_t snapshot_len = strlen(snapshot);
+    size_t replacement_len = strlen(replacement);
+    if (session->sentence_start > snapshot_len || session->sentence_end > snapshot_len || session->sentence_start > session->sentence_end) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Corrupted session bounds");
+        return;
+    }
+
+    size_t new_len = session->sentence_start + replacement_len + (snapshot_len - session->sentence_end);
+    char *new_content = (char *)safe_malloc(new_len + 1);
+    if (!new_content) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Memory allocation failed");
+        return;
+    }
+
+    memcpy(new_content, snapshot, session->sentence_start);
+    memcpy(new_content + session->sentence_start, replacement, replacement_len);
+    memcpy(new_content + session->sentence_start + replacement_len,
+           snapshot + session->sentence_end,
+           snapshot_len - session->sentence_end);
+    new_content[new_len] = '\0';
+
+    if (ss_write_file_content(rec->undopath, snapshot) != 0) {
+        free(new_content);
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to persist undo");
+        return;
+    }
+
+    if (ss_write_file_content(rec->filepath, new_content) != 0) {
+        free(new_content);
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to write file");
+        return;
+    }
+
+    free(new_content);
+
+    rec->undo_available = 1;
+    ss_touch_file_metadata(rec, session->username, 1);
+
+    rec->sentence_locked = 0;
+    rec->locked_sentence_index = -1;
+    rec->lock_owner[0] = '\0';
+
+    pthread_mutex_unlock(&rec->file_lock);
+
+    pthread_mutex_lock(&ss->sessions_lock);
+    WriteSession *detached = ss_detach_session(ss, fd);
+    ss_free_session(detached);
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    const char *fields[] = {RESP_OK_WRITE_DONE};
+    char *resp = protocol_build_message(fields, 1);
+    if (resp) {
+        protocol_send_message(fd, resp);
+        free(resp);
+    }
+
+    log_message(LOG_INFO, "SS", "Write committed on %s by %s", rec->filename, username_copy);
+}
+
+static void handle_client_undo(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 3) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_UNDO");
+        return;
+    }
+
+    const char *username = msg->fields[1];
+    const char *filename = msg->fields[2];
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, filename);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_FILE_NOT_FOUND, "File not found");
+        return;
+    }
+
+    if (!ss_check_write_access(rec, username)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_PERMISSION_DENIED, "No write access");
+        return;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    if (rec->sentence_locked) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_SENTENCE_LOCKED, "File locked for writing");
+        return;
+    }
+
+    if (!rec->undo_available || !file_exists(rec->undopath)) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_NO_UNDO_HISTORY, "No undo available");
+        return;
+    }
+
+    char *undo_content = ss_read_file_content(rec->undopath);
+    if (!undo_content) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to read undo data");
+        return;
+    }
+
+    if (ss_write_file_content(rec->filepath, undo_content) != 0) {
+        free(undo_content);
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to restore file");
+        return;
+    }
+
+    free(undo_content);
+    rec->undo_available = 0;
+    ss_touch_file_metadata(rec, username, 1);
+
+    pthread_mutex_unlock(&rec->file_lock);
+
+    const char *fields[] = {RESP_OK_UNDO};
+    char *resp = protocol_build_message(fields, 1);
+    if (resp) {
+        protocol_send_message(fd, resp);
+        free(resp);
+    }
+}
+
+static void *client_thread(void *arg) {
+    ClientThreadArgs *params = (ClientThreadArgs *)arg;
+    StorageServer *ss = params->ss;
+    int fd = params->client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+    int client_port = params->client_port;
+    strncpy(client_ip, params->client_ip, sizeof(client_ip));
+    free(params);
+
+    while (ss->running) {
+        char *raw = protocol_receive_message(fd);
+        if (!raw) {
+            break;
+        }
+
+        ProtocolMessage msg;
+        if (protocol_parse_message(raw, &msg) != 0 || msg.field_count == 0) {
+            free(raw);
+            continue;
+        }
+
+        const char *command = msg.fields[0];
+
+        if (strcmp(command, MSG_REQ_READ) == 0) {
+            handle_client_read(ss, fd, &msg);
+        } else if (strcmp(command, MSG_REQ_STREAM) == 0) {
+            handle_client_stream(ss, fd, &msg);
+        } else if (strcmp(command, MSG_REQ_WRITE_LOCK) == 0) {
+            handle_client_write_lock(ss, fd, &msg);
+        } else if (strcmp(command, MSG_WRITE_DATA) == 0) {
+            handle_client_write_data(ss, fd, &msg);
+        } else if (strcmp(command, MSG_ETIRW) == 0) {
+            handle_client_etirw(ss, fd);
+        } else if (strcmp(command, MSG_REQ_UNDO) == 0) {
+            handle_client_undo(ss, fd, &msg);
+        } else {
+            send_error_response(fd, ERR_INVALID_REQUEST, "Unsupported command");
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    ss_abort_session(ss, fd);
+    close(fd);
+    log_message(LOG_INFO, "SS", "Client %s:%d disconnected", client_ip, client_port);
+    return NULL;
+}
 
 int ss_init(StorageServer *ss, const char *ns_ip, int ns_port,
             const char *client_ip, int client_port) {
@@ -28,9 +1609,19 @@ int ss_init(StorageServer *ss, const char *ns_ip, int ns_port,
         return -1;
     }
     
-    // Initialize sockets
+    // Initialize state
     ss->ns_sockfd = -1;
     ss->client_sockfd = -1;
+    ss->client_listen_fd = -1;
+    ss->files = NULL;
+    ss->running = 0;
+    pthread_mutex_init(&ss->files_lock, NULL);
+    pthread_mutex_init(&ss->sessions_lock, NULL);
+    ss->sessions = NULL;
+    ss->ns_thread_active = 0;
+    ss->ns_thread_started = 0;
+
+    ss_load_existing_files(ss);
     
     log_message(LOG_INFO, "SS", "Storage server initialized");
     return 0;
@@ -40,12 +1631,17 @@ int ss_register_with_ns(StorageServer *ss) {
     if (!ss) {
         return -1;
     }
-    
-    // TODO: Implement NS registration
-    // 1. Create socket and connect to NS
-    // 2. Send HELLO_SS message
-    // 3. Wait for OK response
-    
+
+    if (ss_open_ns_socket(ss) != 0) {
+        return -1;
+    }
+
+    if (ss_send_hello(ss) != 0) {
+        close(ss->ns_sockfd);
+        ss->ns_sockfd = -1;
+        return -1;
+    }
+
     log_message(LOG_INFO, "SS", "Registered with Name Server");
     return 0;
 }
@@ -54,12 +1650,11 @@ int ss_send_file_list(StorageServer *ss) {
     if (!ss) {
         return -1;
     }
-    
-    // TODO: Implement file list sending
-    // 1. Scan storage directory
-    // 2. Send SS_HAS_FILE for each file
-    // 3. Send SS_FILES_DONE
-    
+
+    if (ss_emit_file_list(ss) != 0) {
+        return -1;
+    }
+
     log_message(LOG_INFO, "SS", "File list sent to Name Server");
     return 0;
 }
@@ -68,14 +1663,58 @@ int ss_start(StorageServer *ss) {
     if (!ss) {
         return -1;
     }
-    
-    // TODO: Implement main server loop
-    // 1. Create listening socket for clients
-    // 2. Accept client connections
-    // 3. Handle protocol messages
-    // 4. Process file operations
-    
-    log_message(LOG_INFO, "SS", "Storage server started");
+
+    if (ss_open_client_listener(ss) != 0) {
+        return -1;
+    }
+
+    ss->running = 1;
+    if (ss_start_ns_thread(ss) != 0) {
+        ss->running = 0;
+        if (ss->client_listen_fd >= 0) {
+            close(ss->client_listen_fd);
+            ss->client_listen_fd = -1;
+        }
+        return -1;
+    }
+
+    log_message(LOG_INFO, "SS", "Storage server started on %s:%d", ss->client_ip, ss->client_port);
+
+    while (ss->running) {
+        struct sockaddr_in client_addr;
+        socklen_t len = sizeof(client_addr);
+        int fd = accept(ss->client_listen_fd, (struct sockaddr *)&client_addr, &len);
+        if (fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            log_message(LOG_WARNING, "SS", "Accept failed: %s", strerror(errno));
+            continue;
+        }
+
+        ClientThreadArgs *args = (ClientThreadArgs *)safe_malloc(sizeof(ClientThreadArgs));
+        if (!args) {
+            close(fd);
+            continue;
+        }
+
+        args->ss = ss;
+        args->client_fd = fd;
+        inet_ntop(AF_INET, &client_addr.sin_addr, args->client_ip, sizeof(args->client_ip));
+        args->client_port = ntohs(client_addr.sin_port);
+
+        log_message(LOG_INFO, "SS", "Client connected from %s:%d", args->client_ip, args->client_port);
+
+        pthread_t t;
+        if (pthread_create(&t, NULL, client_thread, args) != 0) {
+            log_message(LOG_WARNING, "SS", "Failed to spawn client thread");
+            close(fd);
+            free(args);
+            continue;
+        }
+        pthread_detach(t);
+    }
+
     return 0;
 }
 
@@ -84,14 +1723,51 @@ void ss_cleanup(StorageServer *ss) {
         return;
     }
     
+    ss->running = 0;
+
+    if (ss->client_listen_fd >= 0) {
+        close(ss->client_listen_fd);
+        ss->client_listen_fd = -1;
+    }
+
     if (ss->ns_sockfd >= 0) {
         close(ss->ns_sockfd);
+        ss->ns_sockfd = -1;
     }
-    
+
     if (ss->client_sockfd >= 0) {
         close(ss->client_sockfd);
+        ss->client_sockfd = -1;
     }
-    
+
+    if (ss->ns_thread_started) {
+        pthread_join(ss->ns_thread, NULL);
+        ss->ns_thread_started = 0;
+    }
+
+    pthread_mutex_lock(&ss->sessions_lock);
+    WriteSession *pending = ss->sessions;
+    ss->sessions = NULL;
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    while (pending) {
+        WriteSession *next = pending->next;
+        if (pending->file) {
+            pthread_mutex_lock(&pending->file->file_lock);
+            pending->file->sentence_locked = 0;
+            pending->file->locked_sentence_index = -1;
+            pending->file->lock_owner[0] = '\0';
+            pthread_mutex_unlock(&pending->file->file_lock);
+        }
+        ss_free_session(pending);
+        pending = next;
+    }
+
+    pthread_mutex_destroy(&ss->files_lock);
+    pthread_mutex_destroy(&ss->sessions_lock);
+    ss_free_file_records(ss->files);
+    ss->files = NULL;
+
     log_message(LOG_INFO, "SS", "Storage server cleanup complete");
 }
 
