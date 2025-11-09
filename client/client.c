@@ -125,19 +125,6 @@ int client_connect_to_ns(Client *client) {
     return 0;
 }
 
-int client_send_command(Client *client, const char *command) {
-    if (!client || !command) {
-        return -1;
-    }
-    
-    // TODO: Implement command sending
-    // 1. Parse command
-    // 2. Build protocol message
-    // 3. Send to NS or SS (depending on command)
-    // 4. Handle response
-    
-    return 0;
-}
 
 int client_process_command(Client *client, const char *input) {
     if (!client || !input) {
@@ -570,12 +557,6 @@ int client_start(Client *client) {
     printf("Type 'help' for available commands, 'quit' to exit.\n\n");
     
     char input[CLIENT_BUFFER_SIZE];
-    
-    // TODO: Implement main client loop
-    // 1. Read user input
-    // 2. Process commands
-    // 3. Display results
-    // 4. Handle errors
     
     while (1) {
         printf("> ");
