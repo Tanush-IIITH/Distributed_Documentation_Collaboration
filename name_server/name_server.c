@@ -1644,8 +1644,8 @@ int ns_register_storage_server(NameServer *ns, const char *ns_ip, int ns_port,
         if (!info) {
             continue;
         }
-        if (info->is_alive && strcmp(info->ns_ip, ns_ip) == 0 && info->ns_port == ns_port) {
-            log_message(LOG_WARNING, "NS", "Storage server %s:%d already registered", ns_ip, ns_port);
+        if (info->is_alive && strcmp(info->client_ip, client_ip) == 0 && info->client_port == client_port) {
+            log_message(LOG_WARNING, "NS", "Storage server %s:%d already registered", client_ip, client_port);
             return -1;
         }
     }
