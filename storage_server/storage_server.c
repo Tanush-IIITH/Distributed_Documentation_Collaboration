@@ -65,6 +65,36 @@ static int build_path(char *buffer, size_t size, const char *base, const char *f
     return 0;
 }
 
+static int dirent_is_directory(const char *base_path, const struct dirent *entry) {
+    if (!base_path || !entry) {
+        return 0;
+    }
+
+#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR)
+    if (entry->d_type == DT_DIR) {
+        return 1;
+    }
+#endif
+
+#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_UNKNOWN)
+    if (entry->d_type != DT_UNKNOWN) {
+        return 0;
+    }
+#endif
+
+    char full_path[MAX_PATH_LENGTH];
+    if (build_path(full_path, sizeof(full_path), base_path, entry->d_name) != 0) {
+        return 0;
+    }
+
+    struct stat st;
+    if (stat(full_path, &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+
+    return 0;
+}
+
 static void ss_init_file_record(FileRecord *rec, const char *filename, const char *base_path) {
     memset(rec, 0, sizeof(FileRecord));
     safe_strcpy(rec->filename, filename, sizeof(rec->filename));
@@ -210,7 +240,11 @@ static void ss_load_existing_files(StorageServer *ss) {
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_DIR) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        if (dirent_is_directory(ss->storage_path, entry)) {
             continue;
         }
 
