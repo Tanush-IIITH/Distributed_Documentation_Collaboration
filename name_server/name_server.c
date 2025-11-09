@@ -45,6 +45,7 @@ typedef struct {
     int is_client;
     int is_storage_server;
     char username[MAX_USERNAME_LENGTH];
+    StorageServerInfo *ss_info;
 } ConnectionContext;
 
 //close connection and free context
@@ -66,6 +67,167 @@ static void send_error_and_log(int fd, int code, const char *message, const char
         free(err_resp);
     }
     log_message(LOG_WARNING, "NS", "Sent error %d to %s:%d -> %s", code, peer_ip, peer_port, message);
+}
+
+// initialize per-storage-server communication primitives
+static void storage_server_comm_init(StorageServerInfo *ss) {
+    if (!ss) {
+        return;
+    }
+
+    if (pthread_mutex_init(&ss->comm_lock, NULL) != 0) {
+        log_message(LOG_ERROR, "NS", "Failed to init SS comm mutex: %s", strerror(errno));
+    }
+
+    if (pthread_cond_init(&ss->response_cond, NULL) != 0) {
+        log_message(LOG_ERROR, "NS", "Failed to init SS response condition: %s", strerror(errno));
+    }
+
+    ss->awaiting_response = 0;
+    ss->response_ready = 0;
+    ss->response_status = 0;
+    ss->response_raw = NULL;
+    ss->refcount = 0;
+}
+
+// clear and destroy per-storage-server communication primitives
+static void storage_server_comm_destroy(StorageServerInfo *ss) {
+    if (!ss) {
+        return;
+    }
+
+    pthread_mutex_lock(&ss->comm_lock);
+    if (ss->response_raw) {
+        free(ss->response_raw);
+        ss->response_raw = NULL;
+    }
+    ss->awaiting_response = 0;
+    ss->response_ready = 0;
+    ss->response_status = 0;
+    pthread_mutex_unlock(&ss->comm_lock);
+
+    pthread_mutex_destroy(&ss->comm_lock);
+    pthread_cond_destroy(&ss->response_cond);
+}
+
+// increment the reference count while the NS thread is working with the SS entry
+static void storage_server_acquire(StorageServerInfo *ss) {
+    if (!ss) {
+        return;
+    }
+
+    pthread_mutex_lock(&ss->comm_lock);
+    ss->refcount++;
+    pthread_mutex_unlock(&ss->comm_lock);
+}
+
+// release a previously acquired reference to the SS entry
+static void storage_server_release(StorageServerInfo *ss) {
+    if (!ss) {
+        return;
+    }
+
+    pthread_mutex_lock(&ss->comm_lock);
+    if (ss->refcount > 0) {
+        ss->refcount--;
+        if (ss->refcount == 0) {
+            pthread_cond_broadcast(&ss->response_cond);
+        }
+    }
+    pthread_mutex_unlock(&ss->comm_lock);
+}
+
+// signal any waiter that the storage server connection has failed
+static void storage_server_signal_failure(StorageServerInfo *ss) {
+    if (!ss) {
+        return;
+    }
+
+    pthread_mutex_lock(&ss->comm_lock);
+    ss->is_alive = 0;
+    ss->sockfd = -1;
+    if (ss->awaiting_response && !ss->response_ready) {
+        if (ss->response_raw) {
+            free(ss->response_raw);
+            ss->response_raw = NULL;
+        }
+        ss->response_status = -1;
+        ss->response_ready = 1;
+        ss->awaiting_response = 0;
+        pthread_cond_broadcast(&ss->response_cond);
+    }
+    pthread_mutex_unlock(&ss->comm_lock);
+}
+
+// send a request to the storage server and block until the paired response arrives
+static int storage_server_send_and_wait(StorageServerInfo *ss, const char **fields, int field_count, char **out_raw) {
+    if (!ss || !fields || field_count <= 0 || !out_raw) {
+        return -1;
+    }
+
+    if (ss->sockfd < 0 || !ss->is_alive) {
+        return -2;
+    }
+
+    pthread_mutex_lock(&ss->comm_lock);
+
+    while (ss->awaiting_response) {
+        pthread_cond_wait(&ss->response_cond, &ss->comm_lock);
+    }
+
+    if (ss->response_raw) {
+        free(ss->response_raw);
+        ss->response_raw = NULL;
+    }
+    ss->response_ready = 0;
+    ss->response_status = 0;
+
+    char *msg = protocol_build_message(fields, field_count);
+    if (!msg) {
+        pthread_mutex_unlock(&ss->comm_lock);
+        return -3;
+    }
+
+    if (protocol_send_message(ss->sockfd, msg) < 0) {
+        free(msg);
+        pthread_mutex_unlock(&ss->comm_lock);
+        return -4;
+    }
+    free(msg);
+
+    ss->awaiting_response = 1;
+    ss->response_ready = 0;
+    ss->response_status = 0;
+
+    while (!ss->response_ready) {
+        pthread_cond_wait(&ss->response_cond, &ss->comm_lock);
+    }
+
+    if (ss->response_status != 0) {
+        if (ss->response_raw) {
+            free(ss->response_raw);
+            ss->response_raw = NULL;
+        }
+        ss->awaiting_response = 0;
+        ss->response_ready = 0;
+        pthread_cond_broadcast(&ss->response_cond);
+        pthread_mutex_unlock(&ss->comm_lock);
+        return -5;
+    }
+
+    char *raw = ss->response_raw;
+    ss->response_raw = NULL;
+    ss->awaiting_response = 0;
+    ss->response_ready = 0;
+    pthread_cond_broadcast(&ss->response_cond);
+    pthread_mutex_unlock(&ss->comm_lock);
+
+    if (!raw) {
+        return -6;
+    }
+
+    *out_raw = raw;
+    return 0;
 }
 
 /*
@@ -142,8 +304,12 @@ static StorageServerInfo *find_storage_server_by_sockfd(NameServer *ns, int sock
         return NULL;
     }
     for (int i = 0; i < ns->ss_count; i++) {
-        if (ns->storage_servers[i].sockfd == sockfd) {
-            return &ns->storage_servers[i];
+        StorageServerInfo *info = ns->storage_servers[i];
+        if (!info) {
+            continue;
+        }
+        if (info->sockfd == sockfd) {
+            return info;
         }
     }
     return NULL;
@@ -503,49 +669,62 @@ static void run_client_loop(ConnectionContext *ctx) {
                 }
             }
         } else if (strcmp(command, MSG_CREATE) == 0) {
-            // Create flow: validate request, register metadata locally, defer physical creation to storage server layer
+            // Handle the CREATE command: validate input, update metadata, and coordinate with storage servers
+
             if (cmd_msg.field_count < 2) {
+                // Check if the filename is provided in the command
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in CREATE.", ctx->peer_ip, ctx->peer_port);
             } else {
                 const char *filename = cmd_msg.fields[1];
 
                 if (!validate_filename(filename)) {
+                    // Validate the filename format
                     send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename requested for CREATE.", ctx->peer_ip, ctx->peer_port);
                 } else if (ctx->username[0] == '\0') {
+                    // Ensure the client identity is known
                     send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
                 } else {
                     int result = -1;
+                    StorageServerInfo *target_ss = NULL;
+                    int target_ss_acquired = 0;
                     pthread_mutex_lock(&ns->state_lock);
 
                     if (ns->file_count >= NS_MAX_FILES) {
+                        // Check if the maximum file limit is reached
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Maximum file limit reached.", ctx->peer_ip, ctx->peer_port);
                     } else if (file_index_find(ns, filename) != NULL) {
+                        // Check if the file already exists
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_FILE_EXISTS, "File already exists.", ctx->peer_ip, ctx->peer_port);
                     } else if (ns->ss_count == 0) {
+                        // Ensure there are available storage servers
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "No storage servers available.", ctx->peer_ip, ctx->peer_port);
                     } else {
-                        // Round-robin load balancing across live storage servers
-                        StorageServerInfo *target_ss = NULL;
+                        // Select a storage server using round-robin load balancing
                         int start_index = ns->ss_round_robin_index;
 
                         for (int i = 0; i < ns->ss_count; i++) {
                             int current_index = (start_index + i) % ns->ss_count;
-                            if (!ns->storage_servers[current_index].is_alive) {
+                            StorageServerInfo *candidate = ns->storage_servers[current_index];
+                            if (!candidate || !candidate->is_alive) {
                                 continue;
                             }
-                            target_ss = &ns->storage_servers[current_index];
+                            target_ss = candidate;
                             ns->ss_round_robin_index = (current_index + 1) % ns->ss_count;
                             break;
                         }
 
                         if (!target_ss) {
+                            // Handle the case where no alive storage servers are available
                             pthread_mutex_unlock(&ns->state_lock);
                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "No alive storage servers available.", ctx->peer_ip, ctx->peer_port);
                             continue;
                         }
+
+                        storage_server_acquire(target_ss);
+                        target_ss_acquired = 1;
 
                         int new_index = ns->file_count;
                         FileMetadata *file = &ns->files[new_index];
@@ -554,10 +733,16 @@ static void run_client_loop(ConnectionContext *ctx) {
                         if (safe_strcpy(file->filename, filename, sizeof(file->filename)) != 0 ||
                             safe_strcpy(file->owner, ctx->username, sizeof(file->owner)) != 0 ||
                             safe_strcpy(file->ss_ip, target_ss->client_ip, sizeof(file->ss_ip)) != 0) {
+                            // Handle metadata initialization errors
                             memset(file, 0, sizeof(FileMetadata));
+                            if (target_ss_acquired) {
+                                storage_server_release(target_ss);
+                                target_ss_acquired = 0;
+                            }
                             pthread_mutex_unlock(&ns->state_lock);
                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to record file metadata.", ctx->peer_ip, ctx->peer_port);
                         } else {
+                            // Populate metadata fields
                             file->ss_port = target_ss->client_port;
                             time_t now = get_current_time();
                             file->created = now;
@@ -566,27 +751,131 @@ static void run_client_loop(ConnectionContext *ctx) {
                             file->write_access_count = 0;
 
                             if (file_index_insert(ns, filename, new_index) != 0) {
+                                // Handle file indexing errors
                                 memset(file, 0, sizeof(FileMetadata));
+                                if (target_ss_acquired) {
+                                    storage_server_release(target_ss);
+                                    target_ss_acquired = 0;
+                                }
                                 pthread_mutex_unlock(&ns->state_lock);
                                 send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to index new file.", ctx->peer_ip, ctx->peer_port);
                             } else {
+                                // Successfully updated metadata
                                 ns->file_count++;
                                 file_cache_store(ns, filename, new_index);
                                 result = 0;
                                 pthread_mutex_unlock(&ns->state_lock);
 
-                                //not necessary but just for modularity
+                                // --- NEW STORAGE SERVER COORDINATION ---
                                 if (result == 0) {
-                                    char detail[MAX_FIELD_SIZE];
-                                    snprintf(detail, sizeof(detail), "File '%s' registered to %s:%d.", filename, target_ss->client_ip, target_ss->client_port);
-                                    char *resp = protocol_build_ok(detail);
-                                    if (resp) {
-                                        protocol_send_message(ctx->conn_fd, resp);
-                                        free(resp);
+                                    int metadata_valid = 1;
+
+                                    if (!target_ss || target_ss->sockfd < 0) {
+                                        // Ensure the storage server socket is valid
+                                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server socket unavailable.", ctx->peer_ip, ctx->peer_port);
+                                        metadata_valid = 0;
                                     } else {
-                                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
+                                        const char *fields[] = {MSG_CREATE_FILE, filename, ctx->username};
+                                        char *ss_resp_raw = NULL;
+                                        int ss_status = storage_server_send_and_wait(target_ss, fields, 3, &ss_resp_raw);
+                                        if (ss_status != 0) {
+                                            // Map status codes to descriptive messages for the client
+                                            const char *detail = "Storage server communication failure.";
+                                            if (ss_status == -2) {
+                                                detail = "Storage server unavailable.";
+                                            } else if (ss_status == -3) {
+                                                detail = "Failed to encode storage server command.";
+                                            } else if (ss_status == -4) {
+                                                detail = "Failed to send command to storage server.";
+                                            } else if (ss_status == -5) {
+                                                detail = "Storage server disconnected.";
+                                            } else if (ss_status == -6) {
+                                                detail = "Incomplete response from storage server.";
+                                            }
+                                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, detail, ctx->peer_ip, ctx->peer_port);
+                                            if (ss_resp_raw) {
+                                                free(ss_resp_raw);
+                                            }
+                                            metadata_valid = 0;
+                                        } else {
+                                            ProtocolMessage ss_resp_msg;
+                                            if (protocol_parse_message(ss_resp_raw, &ss_resp_msg) != 0 || ss_resp_msg.field_count == 0) {
+                                                // Handle response parsing errors
+                                                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to parse SS response.", ctx->peer_ip, ctx->peer_port);
+                                                metadata_valid = 0;
+                                            } else if (protocol_is_error(&ss_resp_msg)) {
+                                                // Handle error responses from storage server
+                                                int err_code = protocol_get_error_code(&ss_resp_msg);
+                                                const char *detail = (ss_resp_msg.field_count >= 3) ? ss_resp_msg.fields[2] : "Storage server error.";
+                                                send_error_and_log(ctx->conn_fd, err_code, detail, ctx->peer_ip, ctx->peer_port);
+                                                metadata_valid = 0;
+                                            } else if (strcmp(ss_resp_msg.fields[0], RESP_OK_CREATE) == 0) {
+                                                // Handle successful file creation response
+                                                char detail[MAX_FIELD_SIZE];
+                                                snprintf(detail, sizeof(detail), "File '%s' created successfully.", filename);
+                                                char *resp = protocol_build_ok(detail);
+                                                if (resp) {
+                                                    protocol_send_message(ctx->conn_fd, resp);
+                                                    free(resp);
+                                                }
+                                                log_message(LOG_INFO, "NS", "File '%s' created by %s on SS %s:%d.", filename, ctx->username, target_ss->client_ip, target_ss->client_port);
+                                            } else {
+                                                // Handle unexpected responses from storage server
+                                                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected SS response.", ctx->peer_ip, ctx->peer_port);
+                                                metadata_valid = 0;
+                                            }
+
+                                            protocol_free_message(&ss_resp_msg);
+                                            free(ss_resp_raw);
+                                        }
                                     }
-                                    log_message(LOG_INFO, "NS", "File '%s' created by %s.", filename, ctx->username);
+
+                                    if (!metadata_valid) {
+                                        // Rollback metadata changes in case of errors
+                                        pthread_mutex_lock(&ns->state_lock);
+                                        FileIndexNode *node = file_index_find(ns, filename);
+                                        if (node && node->file_array_index >= 0 && node->file_array_index < ns->file_count) {
+                                            memset(&ns->files[node->file_array_index], 0, sizeof(FileMetadata));
+                                        }
+
+                                        unsigned long bucket = hash_filename(filename) % FILE_INDEX_SIZE;
+                                        FileIndexNode *prev = NULL;
+                                        FileIndexNode *iter = ns->file_index[bucket];
+                                        while (iter) {
+                                            if (strcmp(iter->filename, filename) == 0) {
+                                                if (prev) {
+                                                    prev->next = iter->next;
+                                                } else {
+                                                    ns->file_index[bucket] = iter->next;
+                                                }
+                                                free(iter);
+                                                break;
+                                            }
+                                            prev = iter;
+                                            iter = iter->next;
+                                        }
+
+                                        if (ns->file_count > 0) {
+                                            int last_index = ns->file_count - 1;
+                                            FileMetadata *last_meta = &ns->files[last_index];
+                                            if (node && node->file_array_index != last_index && last_meta->filename[0] != '\0') {
+                                                ns->files[node->file_array_index] = *last_meta;
+                                                FileIndexNode *last_node = file_index_find(ns, last_meta->filename);
+                                                if (last_node) {
+                                                    last_node->file_array_index = node->file_array_index;
+                                                }
+                                                memset(last_meta, 0, sizeof(FileMetadata));
+                                            }
+                                            ns->file_count--;
+                                        }
+
+                                        pthread_mutex_unlock(&ns->state_lock);
+                                    }
+                                }
+
+                                if (target_ss_acquired) {
+                                    storage_server_release(target_ss);
+                                    target_ss_acquired = 0;
                                 }
                             }
                         }
@@ -744,12 +1033,14 @@ static void run_ss_loop(ConnectionContext *ctx) {
     }
 
     NameServer *ns = ctx->ns;
+    StorageServerInfo *ss = ctx->ss_info;
 
     // Get storage server information
     while (1) {
         char *file_msg_raw = protocol_receive_message(ctx->conn_fd);
         if (!file_msg_raw) {
             log_message(LOG_WARNING, "NS", "SS %s:%d disconnected during file sync.", ctx->peer_ip, ctx->peer_port);
+            storage_server_signal_failure(ss);
             return;
         }
 
@@ -777,8 +1068,15 @@ static void run_ss_loop(ConnectionContext *ctx) {
             }
 
             pthread_mutex_lock(&ns->state_lock);
-            StorageServerInfo *ss = find_storage_server_by_sockfd(ns, ctx->conn_fd);
-            if (!ss) {
+            StorageServerInfo *ss_entry = ss;
+            if (!ss_entry) {
+                ss_entry = find_storage_server_by_sockfd(ns, ctx->conn_fd);
+                if (ss_entry) {
+                    ctx->ss_info = ss_entry;
+                    ss = ss_entry;
+                }
+            }
+            if (!ss_entry) {
                 pthread_mutex_unlock(&ns->state_lock);
                 send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unknown storage server during file sync.", ctx->peer_ip, ctx->peer_port);
                 protocol_free_message(&file_msg);
@@ -790,10 +1088,10 @@ static void run_ss_loop(ConnectionContext *ctx) {
             FileIndexNode *existing = file_index_find(ns, filename);
             if (existing && existing->file_array_index >= 0 && existing->file_array_index < ns->file_count) {
                 FileMetadata *file = &ns->files[existing->file_array_index];
-                safe_strcpy(file->ss_ip, ss->client_ip, sizeof(file->ss_ip));
-                file->ss_port = ss->client_port;
+                safe_strcpy(file->ss_ip, ss_entry->client_ip, sizeof(file->ss_ip));
+                file->ss_port = ss_entry->client_port;
                 file->modified = now;
-                log_message(LOG_INFO, "NS", "Updated file '%s' location to %s:%d", filename, ss->client_ip, ss->client_port);
+                log_message(LOG_INFO, "NS", "Updated file '%s' location to %s:%d", filename, ss_entry->client_ip, ss_entry->client_port);
                 file_cache_store(ns, filename, existing->file_array_index);
             } else {
                 if (ns->file_count >= NS_MAX_FILES) {
@@ -809,8 +1107,8 @@ static void run_ss_loop(ConnectionContext *ctx) {
                 memset(file, 0, sizeof(FileMetadata));
                 safe_strcpy(file->filename, filename, sizeof(file->filename));
                 file->owner[0] = '\0';
-                safe_strcpy(file->ss_ip, ss->client_ip, sizeof(file->ss_ip));
-                file->ss_port = ss->client_port;
+                safe_strcpy(file->ss_ip, ss_entry->client_ip, sizeof(file->ss_ip));
+                file->ss_port = ss_entry->client_port;
                 file->created = now;
                 file->modified = now;
 
@@ -847,7 +1145,40 @@ static void run_ss_loop(ConnectionContext *ctx) {
         char *raw_command = protocol_receive_message(ctx->conn_fd);
         if (!raw_command) {
             log_message(LOG_INFO, "NS", "SS %s:%d disconnected.", ctx->peer_ip, ctx->peer_port);
+            storage_server_signal_failure(ss);
             break;
+        }
+
+        StorageServerInfo *ss_entry = ss;
+        if (!ss_entry) {
+            pthread_mutex_lock(&ns->state_lock);
+            ss_entry = find_storage_server_by_sockfd(ns, ctx->conn_fd);
+            if (ss_entry) {
+                ctx->ss_info = ss_entry;
+                ss = ss_entry;
+            }
+            pthread_mutex_unlock(&ns->state_lock);
+        }
+
+        int dispatched_to_waiter = 0;
+        if (ss_entry) {
+            pthread_mutex_lock(&ss_entry->comm_lock);
+            if (ss_entry->awaiting_response && !ss_entry->response_ready) {
+                if (ss_entry->response_raw) {
+                    free(ss_entry->response_raw);
+                }
+                ss_entry->response_raw = raw_command;
+                ss_entry->response_status = 0;
+                ss_entry->response_ready = 1;
+                ss_entry->awaiting_response = 0;
+                pthread_cond_broadcast(&ss_entry->response_cond);
+                dispatched_to_waiter = 1;
+            }
+            pthread_mutex_unlock(&ss_entry->comm_lock);
+        }
+
+        if (dispatched_to_waiter) {
+            continue;
         }
 
         ProtocolMessage cmd_msg;
@@ -861,9 +1192,15 @@ static void run_ss_loop(ConnectionContext *ctx) {
         log_request("NS", ctx->peer_ip, ctx->peer_port, "0.0.0.0", ns->port, NULL, command);
 
         // TODO: Handle storage server commands (e.g., heartbeats, write notifications)
+        log_message(LOG_WARNING, "NS", "Unhandled SS command '%s' from %s:%d", command, ctx->peer_ip, ctx->peer_port);
 
         protocol_free_message(&cmd_msg);
         free(raw_command);
+    }
+
+    if (ss) {
+        ss->is_alive = 0;
+        ss->sockfd = -1;
     }
 }
 
@@ -945,6 +1282,10 @@ static void *connection_thread(void *arg) {
             int client_port = atoi(msg.fields[4]);
             pthread_mutex_lock(&ns->state_lock);
             int reg_result = ns_register_storage_server(ns, msg.fields[1], ns_port, msg.fields[3], client_port, ctx->conn_fd);
+            StorageServerInfo *registered_ss = NULL;
+            if (reg_result == 0) {
+                registered_ss = find_storage_server_by_sockfd(ns, ctx->conn_fd);
+            }
             pthread_mutex_unlock(&ns->state_lock);
 
             if (reg_result != 0) {
@@ -960,6 +1301,7 @@ static void *connection_thread(void *arg) {
                 ctx->is_client = 0;
                 ctx->is_storage_server = 1;
                 ctx->username[0] = '\0';
+                ctx->ss_info = registered_ss;
             }
         }
     }
@@ -996,15 +1338,22 @@ static void *connection_thread(void *arg) {
                 break;
             }
         }
-    } else if (ctx->is_storage_server) {
+    }
+
+    StorageServerInfo *ss_to_free = NULL;
+    if (ctx->is_storage_server) {
         for (int i = 0; i < ns->ss_count; i++) {
-            StorageServerInfo *ss = &ns->storage_servers[i];
+            StorageServerInfo *ss = ns->storage_servers[i];
+            if (!ss) {
+                continue;
+            }
             if (ss->sockfd == ctx->conn_fd) {
                 int last_index = ns->ss_count - 1;
+                ss_to_free = ss;
                 if (i != last_index) {
                     ns->storage_servers[i] = ns->storage_servers[last_index];
                 }
-                memset(&ns->storage_servers[last_index], 0, sizeof(StorageServerInfo));
+                ns->storage_servers[last_index] = NULL;
                 ns->ss_count--;
                 log_message(LOG_INFO, "NS", "Storage server %s:%d deregistered", ctx->peer_ip, ctx->peer_port);
                 break;
@@ -1012,6 +1361,17 @@ static void *connection_thread(void *arg) {
         }
     }
     pthread_mutex_unlock(&ns->state_lock);
+
+    if (ss_to_free) {
+        storage_server_signal_failure(ss_to_free);
+        pthread_mutex_lock(&ss_to_free->comm_lock);
+        while (ss_to_free->refcount > 0) {
+            pthread_cond_wait(&ss_to_free->response_cond, &ss_to_free->comm_lock);
+        }
+        pthread_mutex_unlock(&ss_to_free->comm_lock);
+        storage_server_comm_destroy(ss_to_free);
+        free(ss_to_free);
+    }
 
     close_connection(ctx);
     return NULL;
@@ -1091,6 +1451,7 @@ int ns_start(NameServer *ns) {
         ctx->is_client = 0;
         ctx->is_storage_server = 0;
         ctx->username[0] = '\0';
+    ctx->ss_info = NULL;
 
         pthread_t thread_id;
         //call the connection_thread function to handle the connection and detach subsequently
@@ -1119,15 +1480,21 @@ int ns_register_storage_server(NameServer *ns, const char *ns_ip, int ns_port,
     }
 
     for (int i = 0; i < ns->ss_count; i++) {
-        StorageServerInfo *info = &ns->storage_servers[i];
+        StorageServerInfo *info = ns->storage_servers[i];
+        if (!info) {
+            continue;
+        }
         if (info->is_alive && strcmp(info->ns_ip, ns_ip) == 0 && info->ns_port == ns_port) {
             log_message(LOG_WARNING, "NS", "Storage server %s:%d already registered", ns_ip, ns_port);
             return -1;
         }
     }
 
-    StorageServerInfo *ss = &ns->storage_servers[ns->ss_count];
-    memset(ss, 0, sizeof(StorageServerInfo));
+    StorageServerInfo *ss = (StorageServerInfo *)calloc(1, sizeof(StorageServerInfo));
+    if (!ss) {
+        log_message(LOG_ERROR, "NS", "Failed to allocate storage server entry");
+        return -1;
+    }
     strncpy(ss->ns_ip, ns_ip, sizeof(ss->ns_ip) - 1);
     ss->ns_ip[sizeof(ss->ns_ip) - 1] = '\0';
     ss->ns_port = ns_port;
@@ -1137,8 +1504,9 @@ int ns_register_storage_server(NameServer *ns, const char *ns_ip, int ns_port,
     ss->sockfd = sockfd;
     ss->is_alive = 1;
     ss->last_heartbeat = get_current_time();
+    storage_server_comm_init(ss);
 
-    ns->ss_count++;
+    ns->storage_servers[ns->ss_count++] = ss;
 
     log_message(LOG_INFO, "NS", "Registered storage server: %s:%d", client_ip, client_port);
     return 0;
@@ -1196,8 +1564,8 @@ int ns_find_storage_server(NameServer *ns, const char *filename) {
 
     // Step 3: Find the live storage server whose client-facing address matches the file location
     for (int i = 0; i < ns->ss_count; i++) {
-        StorageServerInfo *ss = &ns->storage_servers[i];
-        if (!ss->is_alive) {
+        StorageServerInfo *ss = ns->storage_servers[i];
+        if (!ss || !ss->is_alive) {
             continue;
         }
         if (strncmp(ss->client_ip, file->ss_ip, MAX_IP_LENGTH) == 0 && ss->client_port == file->ss_port) {
@@ -1227,9 +1595,16 @@ void ns_cleanup(NameServer *ns) {
     }
     
     for (int i = 0; i < ns->ss_count; i++) {
-        if (ns->storage_servers[i].sockfd >= 0) {
-            close(ns->storage_servers[i].sockfd);
+        StorageServerInfo *ss = ns->storage_servers[i];
+        if (!ss) {
+            continue;
         }
+        if (ss->sockfd >= 0) {
+            close(ss->sockfd);
+        }
+        storage_server_comm_destroy(ss);
+        free(ss);
+        ns->storage_servers[i] = NULL;
     }
 
     for (int i = 0; i < FILE_INDEX_SIZE; i++) {

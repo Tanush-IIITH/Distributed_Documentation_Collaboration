@@ -33,6 +33,13 @@ typedef struct {
     int sockfd;
     int is_alive;
     time_t last_heartbeat;
+    pthread_mutex_t comm_lock;
+    pthread_cond_t response_cond;
+    int awaiting_response;
+    int response_ready;
+    int response_status;
+    char *response_raw;
+    int refcount;
 } StorageServerInfo;
 
 // Client information
@@ -67,7 +74,7 @@ typedef struct {
     int port; // Port number the Name Server listens on
     int sockfd; // Socket file descriptor for the Name Server
 
-    StorageServerInfo storage_servers[NS_MAX_STORAGE_SERVERS]; // Array to store information about registered storage servers
+    StorageServerInfo *storage_servers[NS_MAX_STORAGE_SERVERS]; // Array of pointers to registered storage servers
     int ss_count; // Count of currently registered storage servers
 
     ClientInfo clients[NS_MAX_CLIENTS]; // Array to store information about connected clients
