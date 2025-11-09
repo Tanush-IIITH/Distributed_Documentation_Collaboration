@@ -69,6 +69,16 @@ static void send_error_and_log(int fd, int code, const char *message, const char
     log_message(LOG_WARNING, "NS", "Sent error %d to %s:%d -> %s", code, peer_ip, peer_port, message);
 }
 
+static void send_simple_ok(int fd, const char *detail) {
+    const char *text = (detail && detail[0]) ? detail : "OK";
+    char *resp = protocol_build_ok(text);
+    if (!resp) {
+        return;
+    }
+    protocol_send_message(fd, resp);
+    free(resp);
+}
+
 // initialize per-storage-server communication primitives
 static void storage_server_comm_init(StorageServerInfo *ss) {
     if (!ss) {
@@ -400,6 +410,84 @@ static void file_cache_store(NameServer *ns, const char *filename, int array_ind
     target->file_array_index = array_index;
     target->last_used = ++ns->cache_tick;
     target->valid = 1;
+}
+
+static int remove_file_metadata_locked(NameServer *ns, const char *filename) {
+    if (!ns || !filename) {
+        return 0;
+    }
+
+    FileIndexNode *node = file_index_find(ns, filename);
+    if (!node) {
+        return 0;
+    }
+
+    int removed_index = (node->file_array_index >= 0 && node->file_array_index < ns->file_count)
+                            ? node->file_array_index
+                            : -1;
+    int original_count = ns->file_count;
+    int last_index = original_count - 1;
+    int moved = 0;
+    FileMetadata moved_meta;
+    memset(&moved_meta, 0, sizeof(moved_meta));
+
+    unsigned long bucket = hash_filename(filename) % FILE_INDEX_SIZE;
+    FileIndexNode *prev = NULL;
+    FileIndexNode *iter = ns->file_index[bucket];
+    while (iter) {
+        if (strcmp(iter->filename, filename) == 0) {
+            if (prev) {
+                prev->next = iter->next;
+            } else {
+                ns->file_index[bucket] = iter->next;
+            }
+            free(iter);
+            break;
+        }
+        prev = iter;
+        iter = iter->next;
+    }
+
+    if (original_count > 0) {
+        if (removed_index < 0 || removed_index >= original_count) {
+            removed_index = last_index;
+        }
+
+        if (removed_index != last_index) {
+            moved_meta = ns->files[last_index];
+            ns->files[removed_index] = moved_meta;
+            moved = (moved_meta.filename[0] != '\0');
+        }
+
+        memset(&ns->files[last_index], 0, sizeof(FileMetadata));
+        ns->file_count = original_count - 1;
+
+        if (moved) {
+            FileIndexNode *moved_node = file_index_find(ns, moved_meta.filename);
+            if (moved_node) {
+                moved_node->file_array_index = removed_index;
+            }
+        }
+    }
+
+    for (int i = 0; i < FILE_CACHE_SIZE; i++) {
+        FileCacheEntry *entry = &ns->file_cache[i];
+        if (!entry->valid) {
+            continue;
+        }
+        if (strcmp(entry->filename, filename) == 0) {
+            entry->valid = 0;
+            continue;
+        }
+        if (moved && strcmp(entry->filename, moved_meta.filename) == 0) {
+            entry->file_array_index = removed_index;
+        }
+        if (entry->valid && entry->file_array_index >= ns->file_count) {
+            entry->valid = 0;
+        }
+    }
+
+    return 1;
 }
 
 static int file_acl_contains(char entries[][MAX_USERNAME_LENGTH], int count, const char *username) {
@@ -833,46 +921,118 @@ static void run_client_loop(ConnectionContext *ctx) {
                                     if (!metadata_valid) {
                                         // Rollback metadata changes in case of errors
                                         pthread_mutex_lock(&ns->state_lock);
-                                        FileIndexNode *node = file_index_find(ns, filename);
-                                        if (node && node->file_array_index >= 0 && node->file_array_index < ns->file_count) {
-                                            memset(&ns->files[node->file_array_index], 0, sizeof(FileMetadata));
+                                        if (!remove_file_metadata_locked(ns, filename)) {
+                                            log_message(LOG_WARNING, "NS", "CREATE rollback: metadata for '%s' already absent.", filename);
                                         }
-
-                                        unsigned long bucket = hash_filename(filename) % FILE_INDEX_SIZE;
-                                        FileIndexNode *prev = NULL;
-                                        FileIndexNode *iter = ns->file_index[bucket];
-                                        while (iter) {
-                                            if (strcmp(iter->filename, filename) == 0) {
-                                                if (prev) {
-                                                    prev->next = iter->next;
-                                                } else {
-                                                    ns->file_index[bucket] = iter->next;
-                                                }
-                                                free(iter);
-                                                break;
-                                            }
-                                            prev = iter;
-                                            iter = iter->next;
-                                        }
-
-                                        if (ns->file_count > 0) {
-                                            int last_index = ns->file_count - 1;
-                                            FileMetadata *last_meta = &ns->files[last_index];
-                                            if (node && node->file_array_index != last_index && last_meta->filename[0] != '\0') {
-                                                ns->files[node->file_array_index] = *last_meta;
-                                                FileIndexNode *last_node = file_index_find(ns, last_meta->filename);
-                                                if (last_node) {
-                                                    last_node->file_array_index = node->file_array_index;
-                                                }
-                                                memset(last_meta, 0, sizeof(FileMetadata));
-                                            }
-                                            ns->file_count--;
-                                        }
-
                                         pthread_mutex_unlock(&ns->state_lock);
                                     }
                                 }
 
+                                if (target_ss_acquired) {
+                                    storage_server_release(target_ss);
+                                    target_ss_acquired = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_DELETE) == 0) {
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in DELETE.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+
+                if (!validate_filename(filename)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename requested for DELETE.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    StorageServerInfo *target_ss = NULL;
+                    int target_ss_acquired = 0;
+                    char *ss_resp_raw = NULL;
+                    ProtocolMessage ss_resp_msg;
+                    int ss_resp_parsed = 0;
+
+                    pthread_mutex_lock(&ns->state_lock);
+                    FileIndexNode *node = file_index_find(ns, filename);
+                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for DELETE.", ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        FileMetadata *file = &ns->files[node->file_array_index];
+                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                            pthread_mutex_unlock(&ns->state_lock);
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may delete the file.", ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            for (int i = 0; i < ns->ss_count; i++) {
+                                StorageServerInfo *candidate = ns->storage_servers[i];
+                                if (!candidate || !candidate->is_alive) {
+                                    continue;
+                                }
+                                if (strncmp(candidate->client_ip, file->ss_ip, MAX_IP_LENGTH) == 0 && candidate->client_port == file->ss_port) {
+                                    target_ss = candidate;
+                                    break;
+                                }
+                            }
+
+                            if (!target_ss || target_ss->sockfd < 0 || !target_ss->is_alive) {
+                                pthread_mutex_unlock(&ns->state_lock);
+                                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server unavailable for DELETE.", ctx->peer_ip, ctx->peer_port);
+                            } else {
+                                storage_server_acquire(target_ss);
+                                target_ss_acquired = 1;
+                                pthread_mutex_unlock(&ns->state_lock);
+
+                                const char *fields[] = {MSG_DELETE_FILE, filename};
+                                int ss_status = storage_server_send_and_wait(target_ss, fields, 2, &ss_resp_raw);
+                                if (ss_status != 0) {
+                                    const char *detail = "Storage server communication failure.";
+                                    if (ss_status == -2) {
+                                        detail = "Storage server unavailable.";
+                                    } else if (ss_status == -3) {
+                                        detail = "Failed to encode storage server command.";
+                                    } else if (ss_status == -4) {
+                                        detail = "Failed to send command to storage server.";
+                                    } else if (ss_status == -5) {
+                                        detail = "Storage server disconnected.";
+                                    } else if (ss_status == -6) {
+                                        detail = "Incomplete response from storage server.";
+                                    }
+                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, detail, ctx->peer_ip, ctx->peer_port);
+                                } else if (protocol_parse_message(ss_resp_raw, &ss_resp_msg) != 0 || ss_resp_msg.field_count == 0) {
+                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to parse SS response.", ctx->peer_ip, ctx->peer_port);
+                                } else {
+                                    ss_resp_parsed = 1;
+                                    if (protocol_is_error(&ss_resp_msg)) {
+                                        int err_code = protocol_get_error_code(&ss_resp_msg);
+                                        const char *detail = (ss_resp_msg.field_count >= 3) ? ss_resp_msg.fields[2] : "Storage server error.";
+                                        send_error_and_log(ctx->conn_fd, err_code, detail, ctx->peer_ip, ctx->peer_port);
+                                    } else if (strcmp(ss_resp_msg.fields[0], RESP_OK_DELETE) != 0) {
+                                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected SS response.", ctx->peer_ip, ctx->peer_port);
+                                    } else {
+                                        pthread_mutex_lock(&ns->state_lock);
+                                        if (!remove_file_metadata_locked(ns, filename)) {
+                                            pthread_mutex_unlock(&ns->state_lock);
+                                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to retire file metadata.", ctx->peer_ip, ctx->peer_port);
+                                        } else {
+                                            pthread_mutex_unlock(&ns->state_lock);
+                                            char detail_buf[MAX_FIELD_SIZE];
+                                            snprintf(detail_buf, sizeof(detail_buf), "File '%s' deleted successfully.", filename);
+                                            send_simple_ok(ctx->conn_fd, detail_buf);
+                                            log_message(LOG_INFO, "NS", "File '%s' deleted by %s via SS %s:%d.", filename, ctx->username, target_ss->client_ip, target_ss->client_port);
+                                        }
+                                    }
+                                }
+
+                                if (ss_resp_parsed) {
+                                    protocol_free_message(&ss_resp_msg);
+                                    ss_resp_parsed = 0;
+                                }
+                                if (ss_resp_raw) {
+                                    free(ss_resp_raw);
+                                    ss_resp_raw = NULL;
+                                }
                                 if (target_ss_acquired) {
                                     storage_server_release(target_ss);
                                     target_ss_acquired = 0;

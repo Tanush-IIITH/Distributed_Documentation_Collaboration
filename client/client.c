@@ -13,6 +13,7 @@ static int client_handle_list(Client *client);
 static int client_handle_addaccess(Client *client, const char *perm_flag, const char *filename, const char *username);
 static int client_handle_remaccess(Client *client, const char *filename, const char *username);
 static int client_handle_create(Client *client, const char *filename);
+static int client_handle_delete(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
 
 int client_init(Client *client, const char *username, const char *ns_ip, int ns_port) {
@@ -181,7 +182,12 @@ int client_process_command(Client *client, const char *input) {
     } else if (strcasecmp(command, "INFO") == 0) {
         // TODO: handle INFO <filename>
     } else if (strcasecmp(command, "DELETE") == 0) {
-        // TODO: handle DELETE <filename>
+        char filename[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", filename) != 1) {
+            printf("Usage: DELETE <filename>\n");
+            return -1;
+        }
+        return client_handle_delete(client, filename);
     } else if (strcasecmp(command, "STREAM") == 0) {
         // TODO: handle STREAM <filename>
     } else if (strcasecmp(command, "LIST") == 0) {
@@ -515,6 +521,43 @@ static int client_handle_create(Client *client, const char *filename) {
     free(raw);
 
     // Return success or error based on the response
+    return is_error ? -1 : 0;
+}
+
+static int client_handle_delete(Client *client, const char *filename) {
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    const char *fields[] = {MSG_DELETE, filename};
+    char *message = protocol_build_message(fields, 2);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send DELETE command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for DELETE\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    int is_error = protocol_is_error(&resp);
+
+    protocol_free_message(&resp);
+    free(raw);
+
     return is_error ? -1 : 0;
 }
 
