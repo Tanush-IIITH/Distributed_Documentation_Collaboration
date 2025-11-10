@@ -545,6 +545,33 @@ static int file_acl_remove(char entries[][MAX_USERNAME_LENGTH], int *count, cons
     return 0;
 }
 
+static void file_acl_parse_csv(char entries[][MAX_USERNAME_LENGTH], int *count, const char *csv) {
+    if (!entries || !count) {
+        return;
+    }
+
+    *count = 0;
+    if (!csv || csv[0] == '\0') {
+        return;
+    }
+
+    char buffer[MAX_FIELD_SIZE];
+    if (safe_strcpy(buffer, csv, sizeof(buffer)) != 0) {
+        buffer[sizeof(buffer) - 1] = '\0';
+    }
+
+    char *token = strtok(buffer, ",");
+    while (token) {
+        trim_string(token);
+        if (token[0] != '\0' && validate_username(token)) {
+            if (file_acl_add(entries, count, token) != 0) {
+                break;
+            }
+        }
+        token = strtok(NULL, ",");
+    }
+}
+
 static int file_add_access(FileMetadata *file, const char *username, int grant_read, int grant_write) {
     if (!file || !username) {
         return -1;
@@ -1535,9 +1562,18 @@ static void run_ss_loop(ConnectionContext *ctx) {
             }
 
             const char *filename = file_msg.fields[1];
-            const char *owner = file_msg.fields[2];
+            const char *owner = file_msg.fields[2] ? file_msg.fields[2] : "";
+            const char *read_acl_csv = (file_msg.field_count >= 4 && file_msg.fields[3]) ? file_msg.fields[3] : "";
+            const char *write_acl_csv = (file_msg.field_count >= 5 && file_msg.fields[4]) ? file_msg.fields[4] : "";
             if (!validate_filename(filename)) {
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename received from storage server.", ctx->peer_ip, ctx->peer_port);
+                protocol_free_message(&file_msg);
+                free(file_msg_raw);
+                continue;
+            }
+
+            if (owner[0] != '\0' && !validate_username(owner)) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid owner received from storage server.", ctx->peer_ip, ctx->peer_port);
                 protocol_free_message(&file_msg);
                 free(file_msg_raw);
                 continue;
@@ -1564,12 +1600,20 @@ static void run_ss_loop(ConnectionContext *ctx) {
             FileIndexNode *existing = file_index_find(ns, filename);
             if (existing && existing->file_array_index >= 0 && existing->file_array_index < ns->file_count) {
                 FileMetadata *file = &ns->files[existing->file_array_index];
+                if (owner[0] != '\0') {
+                    if (safe_strcpy(file->owner, owner, sizeof(file->owner)) != 0) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to record owner metadata.", ctx->peer_ip, ctx->peer_port);
+                        protocol_free_message(&file_msg);
+                        free(file_msg_raw);
+                        continue;
+                    }
+                }
                 safe_strcpy(file->ss_ip, ss_entry->client_ip, sizeof(file->ss_ip));
                 file->ss_port = ss_entry->client_port;
                 file->modified = now;
-                if (owner && owner[0]) {
-                    safe_strcpy(file->owner, owner, sizeof(file->owner));
-                }
+                file_acl_parse_csv(file->read_access_users, &file->read_access_count, read_acl_csv);
+                file_acl_parse_csv(file->write_access_users, &file->write_access_count, write_acl_csv);
                 log_message(LOG_INFO, "NS", "Updated file '%s' location to %s:%d", filename, ss_entry->client_ip, ss_entry->client_port);
                 file_cache_store(ns, filename, existing->file_array_index);
             } else {
@@ -1584,16 +1628,30 @@ static void run_ss_loop(ConnectionContext *ctx) {
                 int new_index = ns->file_count;
                 FileMetadata *file = &ns->files[new_index];
                 memset(file, 0, sizeof(FileMetadata));
-                safe_strcpy(file->filename, filename, sizeof(file->filename));
-                if (owner && owner[0]) {
-                    safe_strcpy(file->owner, owner, sizeof(file->owner));
-                } else {
-                    file->owner[0] = '\0';
+                if (safe_strcpy(file->filename, filename, sizeof(file->filename)) != 0 ||
+                    safe_strcpy(file->ss_ip, ss_entry->client_ip, sizeof(file->ss_ip)) != 0) {
+                    memset(file, 0, sizeof(FileMetadata));
+                    pthread_mutex_unlock(&ns->state_lock);
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to record file metadata.", ctx->peer_ip, ctx->peer_port);
+                    protocol_free_message(&file_msg);
+                    free(file_msg_raw);
+                    continue;
                 }
-                safe_strcpy(file->ss_ip, ss_entry->client_ip, sizeof(file->ss_ip));
+
+                if (owner[0] != '\0' && safe_strcpy(file->owner, owner, sizeof(file->owner)) != 0) {
+                    memset(file, 0, sizeof(FileMetadata));
+                    pthread_mutex_unlock(&ns->state_lock);
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to record owner metadata.", ctx->peer_ip, ctx->peer_port);
+                    protocol_free_message(&file_msg);
+                    free(file_msg_raw);
+                    continue;
+                }
+
                 file->ss_port = ss_entry->client_port;
                 file->created = now;
                 file->modified = now;
+                file_acl_parse_csv(file->read_access_users, &file->read_access_count, read_acl_csv);
+                file_acl_parse_csv(file->write_access_users, &file->write_access_count, write_acl_csv);
 
                 if (file_index_insert(ns, filename, new_index) != 0) {
                     memset(file, 0, sizeof(FileMetadata));

@@ -45,7 +45,7 @@
 // SS -> NS: HELLO_SS|ip_for_ns_comms|port_for_ns_comms|ip_for_client_comms|port_for_client_comms\n
 #define MSG_HELLO_SS "HELLO_SS"
 
-// SS -> NS: SS_HAS_FILE|filename|owner\n
+// SS -> NS: SS_HAS_FILE|filename|owner_username|read_acl_csv|write_acl_csv\n
 #define MSG_SS_HAS_FILE "SS_HAS_FILE"
 
 // SS -> NS: SS_FILES_DONE\n
