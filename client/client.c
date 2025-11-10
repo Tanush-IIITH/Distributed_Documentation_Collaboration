@@ -14,6 +14,7 @@ static int client_handle_addaccess(Client *client, const char *perm_flag, const 
 static int client_handle_remaccess(Client *client, const char *filename, const char *username);
 static int client_handle_create(Client *client, const char *filename);
 static int client_handle_delete(Client *client, const char *filename);
+static int client_handle_info(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
 static int client_request_location(Client *client, const char *operation, const char *filename,
                                    char *out_ip, size_t ip_len, int *out_port,
@@ -177,7 +178,12 @@ int client_process_command(Client *client, const char *input) {
     } else if (strcasecmp(command, "UNDO") == 0) {
         // TODO: handle UNDO <filename>
     } else if (strcasecmp(command, "INFO") == 0) {
-        // TODO: handle INFO <filename>
+        char filename[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", filename) != 1) {
+            printf("Usage: INFO <filename>\n");
+            return -1;
+        }
+        return client_handle_info(client, filename);
     } else if (strcasecmp(command, "DELETE") == 0) {
         char filename[MAX_FILENAME_LENGTH];
         if (sscanf(input, "%*s %511s", filename) != 1) {
@@ -579,6 +585,96 @@ static int client_handle_delete(Client *client, const char *filename) {
     free(raw);
 
     return is_error ? -1 : 0;
+}
+
+static int client_handle_info(Client *client, const char *filename) {
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    const char *fields[] = {MSG_INFO, filename};
+    char *message = protocol_build_message(fields, 2);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send INFO command\n");
+        return -1;
+    }
+
+    int info_started = 0;
+    char display_name[MAX_FILENAME_LENGTH] = {0};
+    safe_strcpy(display_name, filename, sizeof(display_name));
+
+    while (1) {
+        ProtocolMessage msg;
+        char *raw = NULL;
+        if (client_read_response(client, &msg, &raw) != 0) {
+            printf("Connection lost while receiving info\n");
+            return -1;
+        }
+
+        if (msg.field_count == 0) {
+            printf("Malformed response while receiving info\n");
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        const char *type = msg.fields[0];
+
+        if (strcmp(type, RESP_OK_INFO_START) == 0) {
+            if (msg.field_count >= 2 && msg.fields[1] && msg.fields[1][0]) {
+                safe_strcpy(display_name, msg.fields[1], sizeof(display_name));
+            }
+            printf("---- %s ----\n", display_name[0] ? display_name : "File Info");
+            info_started = 1;
+        } else if (strcmp(type, RESP_INFO_LINE) == 0) {
+            if (!info_started) {
+                printf("Unexpected INFO_LINE without INFO_START\n");
+                protocol_free_message(&msg);
+                free(raw);
+                return -1;
+            }
+            if (msg.field_count >= 2 && msg.fields[1]) {
+                printf("%s\n", msg.fields[1]);
+            }
+        } else if (strcmp(type, RESP_OK_INFO_END) == 0) {
+            if (!info_started) {
+                printf("Unexpected INFO_END without INFO_START\n");
+                protocol_free_message(&msg);
+                free(raw);
+                return -1;
+            }
+            printf("\n");
+            protocol_free_message(&msg);
+            free(raw);
+            break;
+        } else {
+            printf("Unexpected response while receiving info: %s\n", type ? type : "<unknown>");
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    return 0;
 }
 
 static int client_request_location(Client *client, const char *operation, const char *filename,

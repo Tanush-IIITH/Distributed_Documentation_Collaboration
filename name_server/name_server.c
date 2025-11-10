@@ -79,6 +79,33 @@ static void send_simple_ok(int fd, const char *detail) {
     free(resp);
 }
 
+static int send_info_line(int fd, const char *line_text) {
+    const char *payload = (line_text && line_text[0]) ? line_text : "N/A";
+    const char *fields[] = {RESP_INFO_LINE, payload};
+    char *resp = protocol_build_message(fields, 2);
+    if (!resp) {
+        return -1;
+    }
+    int rc = protocol_send_message(fd, resp);
+    free(resp);
+    return rc < 0 ? -1 : 0;
+}
+
+static void acl_append_token(char *buffer, size_t buffer_size, const char *token, int *is_first) {
+    if (!buffer || buffer_size == 0 || !token || !token[0] || !is_first) {
+        return;
+    }
+
+    if (*is_first) {
+        buffer[0] = '\0';
+        safe_strcpy(buffer, token, buffer_size);
+        *is_first = 0;
+    } else {
+        safe_strcat(buffer, ", ", buffer_size);
+        safe_strcat(buffer, token, buffer_size);
+    }
+}
+
 // initialize per-storage-server communication primitives
 static void storage_server_comm_init(StorageServerInfo *ss) {
     if (!ss) {
@@ -817,6 +844,323 @@ static void run_client_loop(ConnectionContext *ctx) {
                     free(end_msg);
                 } else {
                     send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build VIEW terminator.", ctx->peer_ip, ctx->peer_port);
+                }
+            }
+        } else if (strcmp(command, MSG_INFO) == 0) {
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in INFO.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+
+                if (!validate_filename(filename)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename requested for INFO.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    StorageServerInfo *target_ss = NULL;
+                    int target_ss_acquired = 0;
+                    int state_locked = 0;
+                    int error_sent = 0;
+                    char resolved_filename[MAX_FILENAME_LENGTH];
+                    char owner[MAX_USERNAME_LENGTH];
+                    char ss_ip[MAX_IP_LENGTH];
+                    int ss_port = 0;
+                    int read_count = 0;
+                    int write_count = 0;
+                    char read_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
+                    char write_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
+                    memset(resolved_filename, 0, sizeof(resolved_filename));
+                    memset(owner, 0, sizeof(owner));
+                    memset(ss_ip, 0, sizeof(ss_ip));
+                    memset(read_users, 0, sizeof(read_users));
+                    memset(write_users, 0, sizeof(write_users));
+
+                    pthread_mutex_lock(&ns->state_lock);
+                    state_locked = 1;
+
+                    do {
+                        FileIndexNode *node = file_index_find(ns, filename);
+                        if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                            send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for INFO.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        FileMetadata *file = &ns->files[node->file_array_index];
+                        if (!file_has_read_access(file, ctx->username)) {
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "User lacks read access for INFO.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        safe_strcpy(resolved_filename, file->filename, sizeof(resolved_filename));
+                        safe_strcpy(owner, file->owner, sizeof(owner));
+                        safe_strcpy(ss_ip, file->ss_ip, sizeof(ss_ip));
+                        ss_port = file->ss_port;
+
+                        read_count = file->read_access_count;
+                        if (read_count < 0) {
+                            read_count = 0;
+                        } else if (read_count > NS_MAX_CLIENTS) {
+                            read_count = NS_MAX_CLIENTS;
+                        }
+                        for (int i = 0; i < read_count; i++) {
+                            safe_strcpy(read_users[i], file->read_access_users[i], sizeof(read_users[i]));
+                        }
+
+                        write_count = file->write_access_count;
+                        if (write_count < 0) {
+                            write_count = 0;
+                        } else if (write_count > NS_MAX_CLIENTS) {
+                            write_count = NS_MAX_CLIENTS;
+                        }
+                        for (int i = 0; i < write_count; i++) {
+                            safe_strcpy(write_users[i], file->write_access_users[i], sizeof(write_users[i]));
+                        }
+
+                        for (int i = 0; i < ns->ss_count; i++) {
+                            StorageServerInfo *candidate = ns->storage_servers[i];
+                            if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
+                                continue;
+                            }
+                            if (strncmp(candidate->client_ip, ss_ip, MAX_IP_LENGTH) == 0 && candidate->client_port == ss_port) {
+                                target_ss = candidate;
+                                break;
+                            }
+                        }
+
+                        if (!target_ss) {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server unavailable for INFO.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        storage_server_acquire(target_ss);
+                        target_ss_acquired = 1;
+                    } while (0);
+
+                    if (state_locked) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        state_locked = 0;
+                    }
+
+                    if (error_sent) {
+                        if (target_ss_acquired) {
+                            storage_server_release(target_ss);
+                        }
+                        continue;
+                    }
+
+                    char *ss_resp_raw = NULL;
+                    int ss_status = 0;
+                    const char *ss_fields[] = {MSG_GET_STATS, resolved_filename};
+                    ss_status = storage_server_send_and_wait(target_ss, ss_fields, 2, &ss_resp_raw);
+
+                    storage_server_release(target_ss);
+                    target_ss_acquired = 0;
+
+                    ProtocolMessage ss_resp_msg;
+
+                    if (ss_status != 0) {
+                        const char *detail = "Storage server communication failure.";
+                        if (ss_status == -2) {
+                            detail = "Storage server unavailable.";
+                        } else if (ss_status == -3) {
+                            detail = "Failed to encode storage server command.";
+                        } else if (ss_status == -4) {
+                            detail = "Failed to send command to storage server.";
+                        } else if (ss_status == -5) {
+                            detail = "Storage server disconnected.";
+                        } else if (ss_status == -6) {
+                            detail = "Incomplete response from storage server.";
+                        }
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, detail, ctx->peer_ip, ctx->peer_port);
+                        if (ss_resp_raw) {
+                            free(ss_resp_raw);
+                        }
+                        continue;
+                    }
+
+                    if (protocol_parse_message(ss_resp_raw, &ss_resp_msg) != 0 || ss_resp_msg.field_count == 0) {
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to parse storage server response.", ctx->peer_ip, ctx->peer_port);
+                        if (ss_resp_raw) {
+                            free(ss_resp_raw);
+                        }
+                        continue;
+                    }
+
+                    if (protocol_is_error(&ss_resp_msg)) {
+                        int err_code = protocol_get_error_code(&ss_resp_msg);
+                        const char *detail = (ss_resp_msg.field_count >= 3) ? ss_resp_msg.fields[2] : "Storage server error.";
+                        send_error_and_log(ctx->conn_fd, err_code, detail, ctx->peer_ip, ctx->peer_port);
+                        protocol_free_message(&ss_resp_msg);
+                        free(ss_resp_raw);
+                        continue;
+                    }
+
+                    if (strcmp(ss_resp_msg.fields[0], RESP_OK_STATS) != 0 || ss_resp_msg.field_count < 10) {
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected storage server response for INFO.", ctx->peer_ip, ctx->peer_port);
+                        protocol_free_message(&ss_resp_msg);
+                        free(ss_resp_raw);
+                        continue;
+                    }
+
+                    const char *start_fields[] = {RESP_OK_INFO_START, resolved_filename};
+                    char *start_msg = protocol_build_message(start_fields, 2);
+                    if (!start_msg) {
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build INFO start message.", ctx->peer_ip, ctx->peer_port);
+                        protocol_free_message(&ss_resp_msg);
+                        free(ss_resp_raw);
+                        continue;
+                    }
+
+                    int send_failed = 0;
+                    if (protocol_send_message(ctx->conn_fd, start_msg) < 0) {
+                        send_failed = 1;
+                    }
+                    free(start_msg);
+
+                    if (!send_failed) {
+                        char line[MAX_FIELD_SIZE];
+
+                        snprintf(line, sizeof(line), "Owner: %s", (ss_resp_msg.field_count >= 3 && ss_resp_msg.fields[2] && ss_resp_msg.fields[2][0]) ? ss_resp_msg.fields[2] : "N/A");
+                        if (send_info_line(ctx->conn_fd, line) != 0) {
+                            send_failed = 1;
+                        }
+
+                        if (!send_failed) {
+                            snprintf(line, sizeof(line), "Size: %s bytes", (ss_resp_msg.fields[3] && ss_resp_msg.fields[3][0]) ? ss_resp_msg.fields[3] : "0");
+                            if (send_info_line(ctx->conn_fd, line) != 0) {
+                                send_failed = 1;
+                            }
+                        }
+
+                        if (!send_failed) {
+                            snprintf(line, sizeof(line), "Words: %s", (ss_resp_msg.fields[4] && ss_resp_msg.fields[4][0]) ? ss_resp_msg.fields[4] : "0");
+                            if (send_info_line(ctx->conn_fd, line) != 0) {
+                                send_failed = 1;
+                            }
+                        }
+
+                        if (!send_failed) {
+                            snprintf(line, sizeof(line), "Chars: %s", (ss_resp_msg.fields[5] && ss_resp_msg.fields[5][0]) ? ss_resp_msg.fields[5] : "0");
+                            if (send_info_line(ctx->conn_fd, line) != 0) {
+                                send_failed = 1;
+                            }
+                        }
+
+                        if (!send_failed) {
+                            long long created_epoch = ss_resp_msg.fields[6] ? atoll(ss_resp_msg.fields[6]) : 0;
+                            char created_buf[64];
+                            if (created_epoch > 0) {
+                                const char *tmp = format_time((time_t)created_epoch);
+                                safe_strcpy(created_buf, tmp ? tmp : "N/A", sizeof(created_buf));
+                            } else {
+                                safe_strcpy(created_buf, "N/A", sizeof(created_buf));
+                            }
+                            snprintf(line, sizeof(line), "Created: %s", created_buf);
+                            if (send_info_line(ctx->conn_fd, line) != 0) {
+                                send_failed = 1;
+                            }
+                        }
+
+                        if (!send_failed) {
+                            long long modified_epoch = ss_resp_msg.fields[7] ? atoll(ss_resp_msg.fields[7]) : 0;
+                            char modified_buf[64];
+                            if (modified_epoch > 0) {
+                                const char *tmp = format_time((time_t)modified_epoch);
+                                safe_strcpy(modified_buf, tmp ? tmp : "N/A", sizeof(modified_buf));
+                            } else {
+                                safe_strcpy(modified_buf, "N/A", sizeof(modified_buf));
+                            }
+                            snprintf(line, sizeof(line), "Modified: %s", modified_buf);
+                            if (send_info_line(ctx->conn_fd, line) != 0) {
+                                send_failed = 1;
+                            }
+                        }
+
+                        if (!send_failed) {
+                            long long access_epoch = ss_resp_msg.fields[8] ? atoll(ss_resp_msg.fields[8]) : 0;
+                            char access_buf[64];
+                            if (access_epoch > 0) {
+                                const char *tmp = format_time((time_t)access_epoch);
+                                safe_strcpy(access_buf, tmp ? tmp : "N/A", sizeof(access_buf));
+                            } else {
+                                safe_strcpy(access_buf, "N/A", sizeof(access_buf));
+                            }
+                            snprintf(line, sizeof(line), "Last Access: %s", access_buf);
+                            if (send_info_line(ctx->conn_fd, line) != 0) {
+                                send_failed = 1;
+                            }
+                        }
+
+                        if (!send_failed) {
+                            const char *last_user = (ss_resp_msg.fields[9] && ss_resp_msg.fields[9][0]) ? ss_resp_msg.fields[9] : "N/A";
+                            snprintf(line, sizeof(line), "Last Access User: %s", last_user);
+                            if (send_info_line(ctx->conn_fd, line) != 0) {
+                                send_failed = 1;
+                            }
+                        }
+
+                        if (!send_failed) {
+                            char read_list[MAX_FIELD_SIZE];
+                            char write_list[MAX_FIELD_SIZE];
+                            read_list[0] = '\0';
+                            write_list[0] = '\0';
+
+                            int read_first = 1;
+                            int write_first = 1;
+
+                            if (owner[0]) {
+                                acl_append_token(read_list, sizeof(read_list), owner, &read_first);
+                                acl_append_token(write_list, sizeof(write_list), owner, &write_first);
+                            }
+
+                            for (int i = 0; i < read_count; i++) {
+                                if (strncmp(read_users[i], owner, MAX_USERNAME_LENGTH) == 0) {
+                                    continue;
+                                }
+                                acl_append_token(read_list, sizeof(read_list), read_users[i], &read_first);
+                            }
+
+                            for (int i = 0; i < write_count; i++) {
+                                if (strncmp(write_users[i], owner, MAX_USERNAME_LENGTH) == 0) {
+                                    continue;
+                                }
+                                acl_append_token(write_list, sizeof(write_list), write_users[i], &write_first);
+                            }
+
+                            if (read_first) {
+                                safe_strcpy(read_list, "None", sizeof(read_list));
+                            }
+                            if (write_first) {
+                                safe_strcpy(write_list, "None", sizeof(write_list));
+                            }
+
+                            snprintf(line, sizeof(line), "Access Rights: Read=[%s]; Write=[%s]", read_list, write_list);
+                            if (send_info_line(ctx->conn_fd, line) != 0) {
+                                send_failed = 1;
+                            }
+                        }
+                    }
+
+                    const char *end_fields[] = {RESP_OK_INFO_END};
+                    char *end_msg = protocol_build_message(end_fields, 1);
+                    if (end_msg) {
+                        if (!send_failed) {
+                            protocol_send_message(ctx->conn_fd, end_msg);
+                        }
+                        free(end_msg);
+                    }
+
+                    if (send_failed) {
+                        log_message(LOG_WARNING, "NS", "Failed to stream INFO response to %s:%d", ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        log_message(LOG_INFO, "NS", "Served INFO for '%s' to %s", resolved_filename, ctx->username);
+                    }
+
+                    protocol_free_message(&ss_resp_msg);
+                    free(ss_resp_raw);
                 }
             }
         } else if (strcmp(command, MSG_CREATE) == 0) {
