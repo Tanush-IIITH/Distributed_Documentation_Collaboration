@@ -28,6 +28,9 @@ static char *ss_read_file_content(const char *path);
 static int ss_write_file_content(const char *path, const char *data);
 static int ss_check_read_access(FileRecord *rec, const char *user);
 static int ss_check_write_access(FileRecord *rec, const char *user);
+static int ss_acl_contains(const char entries[][MAX_USERNAME_LENGTH], int count, const char *username);
+static int ss_acl_add(char entries[][MAX_USERNAME_LENGTH], int *count, const char *username);
+static int ss_acl_remove(char entries[][MAX_USERNAME_LENGTH], int *count, const char *username);
 static int ss_get_sentence_bounds(const char *text, int sentence_index,
                                   size_t *start_out, size_t *end_out);
 static int ss_apply_word_edit(WriteSession *session, int word_index, const char *content);
@@ -629,6 +632,134 @@ static void *ns_control_loop(void *arg) {
                     }
                 }
             }
+        } else if (strcmp(command, MSG_SS_ADDACCESS) == 0) {
+            if (msg.field_count < 4) {
+                ss_send_ns_error(ss, ERR_INVALID_REQUEST, "ADDACCESS missing fields");
+            } else {
+                const char *filename = msg.fields[1];
+                const char *username = msg.fields[2];
+                const char *perm_token = msg.fields[3];
+
+                pthread_mutex_lock(&ss->files_lock);
+                FileRecord *rec = ss_find_file(ss, filename);
+                if (!rec) {
+                    pthread_mutex_unlock(&ss->files_lock);
+                    ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "File not found");
+                } else {
+                    pthread_mutex_lock(&rec->file_lock);
+                    pthread_mutex_unlock(&ss->files_lock);
+
+                    int want_read = 0;
+                    int want_write = 0;
+                    for (const char *p = perm_token; p && *p; ++p) {
+                        char c = (char)toupper((unsigned char)*p);
+                        if (c == 'R') {
+                            want_read = 1;
+                        } else if (c == 'W') {
+                            want_write = 1;
+                        }
+                    }
+
+                    if (!want_read && !want_write) {
+                        pthread_mutex_unlock(&rec->file_lock);
+                        ss_send_ns_error(ss, ERR_INVALID_REQUEST, "Invalid permission token");
+                    } else {
+                        int had_read = ss_acl_contains(rec->read_users, rec->read_count, username);
+                        int had_write = ss_acl_contains(rec->write_users, rec->write_count, username);
+                        int added_read = 0;
+                        int added_write = 0;
+                        int status = 0;
+
+                        if (want_read && !had_read) {
+                            int add_res = ss_acl_add(rec->read_users, &rec->read_count, username);
+                            if (add_res < 0) {
+                                status = -1;
+                            } else {
+                                added_read = add_res > 0;
+                            }
+                        }
+
+                        if (status == 0 && want_write && !had_write) {
+                            int add_res = ss_acl_add(rec->write_users, &rec->write_count, username);
+                            if (add_res < 0) {
+                                status = -1;
+                            } else {
+                                added_write = add_res > 0;
+                            }
+                        }
+
+                        int metadata_error = 0;
+                        if (status == 0 && (added_read || added_write)) {
+                            if (ss_write_metadata(rec) != 0) {
+                                metadata_error = 1;
+                            }
+                        }
+
+                        if (status != 0 || metadata_error) {
+                            if (added_read) {
+                                ss_acl_remove(rec->read_users, &rec->read_count, username);
+                            }
+                            if (added_write) {
+                                ss_acl_remove(rec->write_users, &rec->write_count, username);
+                            }
+                            pthread_mutex_unlock(&rec->file_lock);
+                            ss_send_ns_error(ss, ERR_INTERNAL_ERROR, "Failed to update ACL metadata");
+                        } else {
+                            pthread_mutex_unlock(&rec->file_lock);
+                            const char *fields[] = {RESP_OK_ACCESS_CHANGED, filename};
+                            char *resp = protocol_build_message(fields, 2);
+                            if (resp) {
+                                protocol_send_message(ss->ns_sockfd, resp);
+                                free(resp);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_SS_REMACCESS) == 0) {
+            if (msg.field_count < 3) {
+                ss_send_ns_error(ss, ERR_INVALID_REQUEST, "REMACCESS missing fields");
+            } else {
+                const char *filename = msg.fields[1];
+                const char *username = msg.fields[2];
+
+                pthread_mutex_lock(&ss->files_lock);
+                FileRecord *rec = ss_find_file(ss, filename);
+                if (!rec) {
+                    pthread_mutex_unlock(&ss->files_lock);
+                    ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "File not found");
+                } else {
+                    pthread_mutex_lock(&rec->file_lock);
+                    pthread_mutex_unlock(&ss->files_lock);
+
+                    int removed_read = ss_acl_remove(rec->read_users, &rec->read_count, username);
+                    int removed_write = ss_acl_remove(rec->write_users, &rec->write_count, username);
+
+                    if (!removed_read && !removed_write) {
+                        pthread_mutex_unlock(&rec->file_lock);
+                        ss_send_ns_error(ss, ERR_USER_NOT_FOUND, "User not present in ACL");
+                    } else {
+                        if (ss_write_metadata(rec) != 0) {
+                            if (removed_read) {
+                                ss_acl_add(rec->read_users, &rec->read_count, username);
+                            }
+                            if (removed_write) {
+                                ss_acl_add(rec->write_users, &rec->write_count, username);
+                            }
+                            pthread_mutex_unlock(&rec->file_lock);
+                            ss_send_ns_error(ss, ERR_INTERNAL_ERROR, "Failed to persist ACL metadata");
+                        } else {
+                            pthread_mutex_unlock(&rec->file_lock);
+                            const char *fields[] = {RESP_OK_ACCESS_CHANGED, filename};
+                            char *resp = protocol_build_message(fields, 2);
+                            if (resp) {
+                                protocol_send_message(ss->ns_sockfd, resp);
+                                free(resp);
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             log_message(LOG_WARNING, "SS", "Unknown NS command: %s", command);
         }
@@ -736,6 +867,61 @@ static int ss_check_write_access(FileRecord *rec, const char *user) {
             return 1;
         }
     }
+    return 0;
+}
+
+static int ss_acl_contains(const char entries[][MAX_USERNAME_LENGTH], int count, const char *username) {
+    if (!username) {
+        return 0;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (strncmp(entries[i], username, MAX_USERNAME_LENGTH) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int ss_acl_add(char entries[][MAX_USERNAME_LENGTH], int *count, const char *username) {
+    if (!entries || !count || !username) {
+        return -1;
+    }
+
+    if (ss_acl_contains(entries, *count, username)) {
+        return 0;
+    }
+
+    if (*count >= SS_MAX_USERS_PER_FILE) {
+        return -1;
+    }
+
+    if (safe_strcpy(entries[*count], username, MAX_USERNAME_LENGTH) != 0) {
+        return -1;
+    }
+
+    (*count)++;
+    return 1;
+}
+
+static int ss_acl_remove(char entries[][MAX_USERNAME_LENGTH], int *count, const char *username) {
+    if (!entries || !count || !username) {
+        return 0;
+    }
+
+    for (int i = 0; i < *count; i++) {
+        if (strncmp(entries[i], username, MAX_USERNAME_LENGTH) == 0) {
+            int last_index = *count - 1;
+            if (i != last_index) {
+                memcpy(entries[i], entries[last_index], MAX_USERNAME_LENGTH);
+            }
+            entries[last_index][0] = '\0';
+            (*count)--;
+            return 1;
+        }
+    }
+
     return 0;
 }
 

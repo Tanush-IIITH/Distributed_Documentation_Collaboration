@@ -490,7 +490,7 @@ static int remove_file_metadata_locked(NameServer *ns, const char *filename) {
     return 1;
 }
 
-static int file_acl_contains(char entries[][MAX_USERNAME_LENGTH], int count, const char *username) {
+static int file_acl_contains(const char entries[][MAX_USERNAME_LENGTH], int count, const char *username) {
     if (!username) {
         return 0;
     }
@@ -1164,35 +1164,164 @@ static void run_client_loop(ConnectionContext *ctx) {
                 } else if (ctx->username[0] == '\0') {
                     send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
                 } else {
-                    int result = -1;
-                    pthread_mutex_lock(&ns->state_lock);
-                    FileIndexNode *node = file_index_find(ns, filename);
-                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
-                        pthread_mutex_unlock(&ns->state_lock);
-                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for ADDACCESS.", ctx->peer_ip, ctx->peer_port);
-                    } else {
-                        FileMetadata *file = &ns->files[node->file_array_index];
-                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
-                            pthread_mutex_unlock(&ns->state_lock);
-                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may modify access.", ctx->peer_ip, ctx->peer_port);
-                        } else {
-                            result = file_add_access(file, target_user, grant_read, grant_write);
-                            pthread_mutex_unlock(&ns->state_lock);
+                    StorageServerInfo *target_ss = NULL;
+                    int target_ss_acquired = 0;
+                    char *ss_resp_raw = NULL;
+                    int file_index = -1;
+                    int metadata_applied = 0;
+                    int rollback_needed = 0;
+                    int success = 0;
+                    int error_sent = 0;
+                    int state_locked = 0;
 
-                            if (result != 0) {
-                                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
-                            } else {
-                                char detail[MAX_FIELD_SIZE];
-                                snprintf(detail, sizeof(detail), "Access granted to %s (%s).", target_user, permission);
-                                char *resp = protocol_build_ok(detail);
-                                if (resp) {
-                                    protocol_send_message(ctx->conn_fd, resp);
-                                    free(resp);
-                                } else {
-                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
-                                }
+                    pthread_mutex_lock(&ns->state_lock);
+                    state_locked = 1;
+
+                    do {
+                        FileIndexNode *node = file_index_find(ns, filename);
+                        if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                            send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for ADDACCESS.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        file_index = node->file_array_index;
+                        FileMetadata *file = &ns->files[file_index];
+
+                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may modify access.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        if (file_add_access(file, target_user, grant_read, grant_write) != 0) {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        metadata_applied = 1;
+
+                        for (int i = 0; i < ns->ss_count; i++) {
+                            StorageServerInfo *candidate = ns->storage_servers[i];
+                            if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
+                                continue;
+                            }
+                            if (strncmp(candidate->client_ip, file->ss_ip, MAX_IP_LENGTH) == 0 &&
+                                candidate->client_port == file->ss_port) {
+                                target_ss = candidate;
+                                storage_server_acquire(target_ss);
+                                target_ss_acquired = 1;
+                                break;
                             }
                         }
+
+                        pthread_mutex_unlock(&ns->state_lock);
+                        state_locked = 0;
+
+                        if (!target_ss) {
+                            rollback_needed = 1;
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server is offline.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        char perm_token[3];
+                        int perm_len = 0;
+                        if (grant_read) {
+                            perm_token[perm_len++] = 'R';
+                        }
+                        if (grant_write) {
+                            perm_token[perm_len++] = 'W';
+                        }
+                        perm_token[perm_len] = '\0';
+
+                        const char *ss_fields[] = {MSG_SS_ADDACCESS, filename, target_user, perm_token};
+                        int ss_status = storage_server_send_and_wait(target_ss, ss_fields, 4, &ss_resp_raw);
+                        if (ss_status != 0) {
+                            rollback_needed = 1;
+                            const char *detail = "Storage server communication failure.";
+                            if (ss_status == -2) {
+                                detail = "Storage server unavailable.";
+                            } else if (ss_status == -3) {
+                                detail = "Failed to encode storage server command.";
+                            } else if (ss_status == -4) {
+                                detail = "Failed to send command to storage server.";
+                            } else if (ss_status == -5) {
+                                detail = "Storage server disconnected.";
+                            } else if (ss_status == -6) {
+                                detail = "Incomplete response from storage server.";
+                            }
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, detail, ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        ProtocolMessage ss_resp_msg;
+                        if (protocol_parse_message(ss_resp_raw, &ss_resp_msg) != 0 || ss_resp_msg.field_count == 0) {
+                            rollback_needed = 1;
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to parse SS response.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        if (protocol_is_error(&ss_resp_msg)) {
+                            rollback_needed = 1;
+                            int err_code = protocol_get_error_code(&ss_resp_msg);
+                            const char *detail = (ss_resp_msg.field_count >= 3) ? ss_resp_msg.fields[2] : "Storage server error.";
+                            send_error_and_log(ctx->conn_fd, err_code, detail, ctx->peer_ip, ctx->peer_port);
+                            protocol_free_message(&ss_resp_msg);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        if (strcmp(ss_resp_msg.fields[0], RESP_OK_ACCESS_CHANGED) != 0) {
+                            rollback_needed = 1;
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected SS response.", ctx->peer_ip, ctx->peer_port);
+                            protocol_free_message(&ss_resp_msg);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        protocol_free_message(&ss_resp_msg);
+                        success = 1;
+                    } while (0);
+
+                    if (state_locked) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        state_locked = 0;
+                    }
+
+                    if (ss_resp_raw) {
+                        free(ss_resp_raw);
+                        ss_resp_raw = NULL;
+                    }
+
+                    if (target_ss_acquired) {
+                        storage_server_release(target_ss);
+                    }
+
+                    if (!success && metadata_applied && rollback_needed) {
+                        pthread_mutex_lock(&ns->state_lock);
+                        if (file_index >= 0 && file_index < ns->file_count) {
+                            FileMetadata *file = &ns->files[file_index];
+                            file_remove_access(file, target_user);
+                        }
+                        pthread_mutex_unlock(&ns->state_lock);
+                    }
+
+                    if (success) {
+                        char detail[MAX_FIELD_SIZE];
+                        snprintf(detail, sizeof(detail), "Access granted to %s (%s).", target_user, permission);
+                        char *resp = protocol_build_ok(detail);
+                        if (resp) {
+                            protocol_send_message(ctx->conn_fd, resp);
+                            free(resp);
+                        } else {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
+                        }
+                    } else if (!error_sent) {
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
                     }
                 }
             }
@@ -1208,35 +1337,159 @@ static void run_client_loop(ConnectionContext *ctx) {
                 } else if (ctx->username[0] == '\0') {
                     send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
                 } else {
-                    int removed = 0;
-                    pthread_mutex_lock(&ns->state_lock);
-                    FileIndexNode *node = file_index_find(ns, filename);
-                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
-                        pthread_mutex_unlock(&ns->state_lock);
-                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for REMACCESS.", ctx->peer_ip, ctx->peer_port);
-                    } else {
-                        FileMetadata *file = &ns->files[node->file_array_index];
-                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
-                            pthread_mutex_unlock(&ns->state_lock);
-                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may modify access.", ctx->peer_ip, ctx->peer_port);
-                        } else {
-                            removed = file_remove_access(file, target_user);
-                            pthread_mutex_unlock(&ns->state_lock);
+                    StorageServerInfo *target_ss = NULL;
+                    int target_ss_acquired = 0;
+                    char *ss_resp_raw = NULL;
+                    int file_index = -1;
+                    int metadata_applied = 0;
+                    int rollback_needed = 0;
+                    int success = 0;
+                    int error_sent = 0;
+                    int state_locked = 0;
+                    int had_read = 0;
+                    int had_write = 0;
 
-                            if (!removed) {
-                                send_error_and_log(ctx->conn_fd, ERR_USER_NOT_FOUND, "User had no explicit access.", ctx->peer_ip, ctx->peer_port);
-                            } else {
-                                char detail[MAX_FIELD_SIZE];
-                                snprintf(detail, sizeof(detail), "Access revoked for %s.", target_user);
-                                char *resp = protocol_build_ok(detail);
-                                if (resp) {
-                                    protocol_send_message(ctx->conn_fd, resp);
-                                    free(resp);
-                                } else {
-                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
-                                }
+                    pthread_mutex_lock(&ns->state_lock);
+                    state_locked = 1;
+
+                    do {
+                        FileIndexNode *node = file_index_find(ns, filename);
+                        if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                            send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for REMACCESS.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        file_index = node->file_array_index;
+                        FileMetadata *file = &ns->files[file_index];
+
+                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may modify access.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        had_read = file_acl_contains(file->read_access_users, file->read_access_count, target_user);
+                        had_write = file_acl_contains(file->write_access_users, file->write_access_count, target_user);
+
+                        if (!file_remove_access(file, target_user)) {
+                            send_error_and_log(ctx->conn_fd, ERR_USER_NOT_FOUND, "User had no explicit access.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        metadata_applied = 1;
+
+                        for (int i = 0; i < ns->ss_count; i++) {
+                            StorageServerInfo *candidate = ns->storage_servers[i];
+                            if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
+                                continue;
+                            }
+                            if (strncmp(candidate->client_ip, file->ss_ip, MAX_IP_LENGTH) == 0 &&
+                                candidate->client_port == file->ss_port) {
+                                target_ss = candidate;
+                                storage_server_acquire(target_ss);
+                                target_ss_acquired = 1;
+                                break;
                             }
                         }
+
+                        pthread_mutex_unlock(&ns->state_lock);
+                        state_locked = 0;
+
+                        if (!target_ss) {
+                            rollback_needed = 1;
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server is offline.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        const char *ss_fields[] = {MSG_SS_REMACCESS, filename, target_user};
+                        int ss_status = storage_server_send_and_wait(target_ss, ss_fields, 3, &ss_resp_raw);
+                        if (ss_status != 0) {
+                            rollback_needed = 1;
+                            const char *detail = "Storage server communication failure.";
+                            if (ss_status == -2) {
+                                detail = "Storage server unavailable.";
+                            } else if (ss_status == -3) {
+                                detail = "Failed to encode storage server command.";
+                            } else if (ss_status == -4) {
+                                detail = "Failed to send command to storage server.";
+                            } else if (ss_status == -5) {
+                                detail = "Storage server disconnected.";
+                            } else if (ss_status == -6) {
+                                detail = "Incomplete response from storage server.";
+                            }
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, detail, ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        ProtocolMessage ss_resp_msg;
+                        if (protocol_parse_message(ss_resp_raw, &ss_resp_msg) != 0 || ss_resp_msg.field_count == 0) {
+                            rollback_needed = 1;
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to parse SS response.", ctx->peer_ip, ctx->peer_port);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        if (protocol_is_error(&ss_resp_msg)) {
+                            rollback_needed = 1;
+                            int err_code = protocol_get_error_code(&ss_resp_msg);
+                            const char *detail = (ss_resp_msg.field_count >= 3) ? ss_resp_msg.fields[2] : "Storage server error.";
+                            send_error_and_log(ctx->conn_fd, err_code, detail, ctx->peer_ip, ctx->peer_port);
+                            protocol_free_message(&ss_resp_msg);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        if (strcmp(ss_resp_msg.fields[0], RESP_OK_ACCESS_CHANGED) != 0) {
+                            rollback_needed = 1;
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected SS response.", ctx->peer_ip, ctx->peer_port);
+                            protocol_free_message(&ss_resp_msg);
+                            error_sent = 1;
+                            break;
+                        }
+
+                        protocol_free_message(&ss_resp_msg);
+                        success = 1;
+                    } while (0);
+
+                    if (state_locked) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        state_locked = 0;
+                    }
+
+                    if (ss_resp_raw) {
+                        free(ss_resp_raw);
+                        ss_resp_raw = NULL;
+                    }
+
+                    if (target_ss_acquired) {
+                        storage_server_release(target_ss);
+                    }
+
+                    if (!success && metadata_applied && rollback_needed) {
+                        pthread_mutex_lock(&ns->state_lock);
+                        if (file_index >= 0 && file_index < ns->file_count) {
+                            FileMetadata *file = &ns->files[file_index];
+                            file_add_access(file, target_user, had_read, had_write);
+                        }
+                        pthread_mutex_unlock(&ns->state_lock);
+                    }
+
+                    if (success) {
+                        char detail[MAX_FIELD_SIZE];
+                        snprintf(detail, sizeof(detail), "Access revoked for %s.", target_user);
+                        char *resp = protocol_build_ok(detail);
+                        if (resp) {
+                            protocol_send_message(ctx->conn_fd, resp);
+                            free(resp);
+                        } else {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
+                        }
+                    } else if (!error_sent) {
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
                     }
                 }
             }

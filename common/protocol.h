@@ -95,6 +95,12 @@
 // NS -> SS: GET_CONTENT|filename\n
 #define MSG_GET_CONTENT "GET_CONTENT"
 
+// NS -> SS: SS_ADDACCESS|filename|username|permission_token\n
+#define MSG_SS_ADDACCESS "SS_ADDACCESS"
+
+// NS -> SS: SS_REMACCESS|filename|username\n
+#define MSG_SS_REMACCESS "SS_REMACCESS"
+
 // ============================================================================
 // MESSAGE TYPES - LOCATION REQUEST (C -> NS)
 // ============================================================================
@@ -169,6 +175,7 @@
 // Specific OK responses
 #define RESP_OK_CREATE "OK_CREATE"
 #define RESP_OK_DELETE "OK_DELETE"
+#define RESP_OK_ACCESS_CHANGED "OK_ACCESS_CHANGED"
 #define RESP_OK_STATS "OK_STATS"
 #define RESP_OK_CONTENT "OK_CONTENT"
 #define RESP_OK_LOCKED "OK_LOCKED"

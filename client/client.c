@@ -420,7 +420,15 @@ static int client_handle_addaccess(Client *client, const char *perm_flag, const 
         return -1;
     }
 
-    const char *fields[] = {MSG_ADDACCESS, filename, username, perm_flag};
+    const char *permission_to_send = perm_flag;
+    if (perm_flag && perm_flag[0] == '-') {
+        permission_to_send = perm_flag + 1;
+        if (!permission_to_send[0]) {
+            permission_to_send = perm_flag;
+        }
+    }
+
+    const char *fields[] = {MSG_ADDACCESS, filename, username, permission_to_send};
     char *message = protocol_build_message(fields, 4);
     if (!message) {
         return -1;
