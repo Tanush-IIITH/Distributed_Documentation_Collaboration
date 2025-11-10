@@ -329,7 +329,12 @@ static int client_handle_view(Client *client, const char *flags) {
         return -1;
     }
 
-    printf("%s files%s:\n", request_all ? "All" : "Accessible", request_details ? " (detailed)" : "");
+    if (request_details) {
+        printf("---------------------------------------------------------\n");
+        printf("|  Filename  | Words | Chars | Last Access Time | Owner |\n");
+        printf("|------------|-------|-------|------------------|-------|\n");
+    }
+
     while (1) {
         ProtocolMessage msg;
         char *raw = NULL;
@@ -345,14 +350,20 @@ static int client_handle_view(Client *client, const char *flags) {
         }
 
         if (msg.field_count >= 2 && strcmp(msg.fields[0], RESP_OK_VIEW_L) == 0) {
-            if (msg.field_count >= 7) {
-                printf(" - %s\n", msg.fields[1]);
-                printf("   owner: %s\n", msg.fields[2][0] ? msg.fields[2] : "N/A");
-                printf("   words: %s, chars: %s\n", msg.fields[3], msg.fields[4]);
-                printf("   last access: %s\n", msg.fields[5]);
-                printf("   last modified: %s\n", msg.fields[6]);
-            } else {
-                printf(" - %s\n", msg.fields[1]);
+            if (request_details && msg.field_count >= 6) {
+                const char *filename = msg.fields[1];
+                const char *owner = msg.field_count >= 3 ? msg.fields[2] : "";
+                const char *words = msg.field_count >= 4 ? msg.fields[3] : "";
+                const char *chars = msg.field_count >= 5 ? msg.fields[4] : "";
+                const char *last_access = msg.field_count >= 6 ? msg.fields[5] : "";
+                printf("| %-10s | %5s | %5s | %-16s | %-5s |\n",
+                       filename ? filename : "",
+                       words ? words : "",
+                       chars ? chars : "",
+                       last_access ? last_access : "",
+                       (owner && owner[0]) ? owner : "N/A");
+            } else if (!request_details) {
+                printf("--> %s\n", msg.fields[1]);
             }
         } else if (protocol_is_error(&msg)) {
             client_print_ns_response(&msg);
@@ -363,6 +374,10 @@ static int client_handle_view(Client *client, const char *flags) {
 
         protocol_free_message(&msg);
         free(raw);
+    }
+
+    if (request_details) {
+        printf("---------------------------------------------------------\n");
     }
 
     return 0;

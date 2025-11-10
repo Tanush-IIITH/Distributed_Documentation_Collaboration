@@ -454,8 +454,9 @@ static int ss_emit_file_list(StorageServer *ss) {
     pthread_mutex_lock(&ss->files_lock);
     FileRecord *node = ss->files;
     while (node) {
-        const char *fields[] = {MSG_SS_HAS_FILE, node->filename};
-        char *msg = protocol_build_message(fields, 2);
+        const char *owner = node->owner[0] ? node->owner : "";
+        const char *fields[] = {MSG_SS_HAS_FILE, node->filename, owner};
+        char *msg = protocol_build_message(fields, 3);
         if (!msg) {
             pthread_mutex_unlock(&ss->files_lock);
             return -1;
