@@ -15,6 +15,11 @@ static int client_handle_remaccess(Client *client, const char *filename, const c
 static int client_handle_create(Client *client, const char *filename);
 static int client_handle_delete(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
+static int client_request_location(Client *client, const char *operation, const char *filename,
+                                   char *out_ip, size_t ip_len, int *out_port,
+                                   char *out_filename, size_t filename_len);
+static int client_connect_to_storage(const char *ip, int port);
+static int client_receive_read_stream(int ss_fd, const char *display_name);
 
 int client_init(Client *client, const char *username, const char *ns_ip, int ns_port) {
     if (!client || !username || !ns_ip) {
@@ -154,7 +159,12 @@ int client_process_command(Client *client, const char *input) {
         const char *flags = flags_buffer[0] ? flags_buffer : NULL;
         return client_handle_view(client, flags);
     } else if (strcasecmp(command, "READ") == 0) {
-        // TODO: handle READ <filename>
+        char filename[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", filename) != 1) {
+            printf("Usage: READ <filename>\n");
+            return -1;
+        }
+        return client_handle_read(client, filename);
     } else if (strcasecmp(command, "CREATE") == 0) {
         char filename[MAX_FILENAME_LENGTH];
         if (sscanf(input, "%*s %511s", filename) != 1) {
@@ -546,6 +556,206 @@ static int client_handle_delete(Client *client, const char *filename) {
     free(raw);
 
     return is_error ? -1 : 0;
+}
+
+static int client_request_location(Client *client, const char *operation, const char *filename,
+                                   char *out_ip, size_t ip_len, int *out_port,
+                                   char *out_filename, size_t filename_len) {
+    if (!client || client->ns_sockfd < 0 || !operation || !filename || !out_ip || !out_port) {
+        return -1;
+    }
+
+    const char *fields[] = {MSG_REQ_LOC, operation, filename};
+    char *message = protocol_build_message(fields, 3);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to contact Name Server for REQ_LOC\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for REQ_LOC\n");
+        return -1;
+    }
+
+    int status = -1;
+    if (protocol_is_error(&resp)) {
+        client_print_ns_response(&resp);
+    } else if (resp.field_count < 4 || strcmp(resp.fields[0], RESP_OK_LOC) != 0) {
+        printf("Unexpected response from Name Server for REQ_LOC\n");
+    } else {
+        char *endptr = NULL;
+        long port_val = strtol(resp.fields[3], &endptr, 10);
+        if (!resp.fields[3][0] || (endptr && *endptr != '\0')) {
+            printf("Invalid port in Name Server response\n");
+        } else if (!is_valid_port((int)port_val)) {
+            printf("Out-of-range port in Name Server response\n");
+        } else if (safe_strcpy(out_ip, resp.fields[2], ip_len) != 0) {
+            printf("Failed to copy storage server IP\n");
+        } else if (out_filename && filename_len > 0 && safe_strcpy(out_filename, resp.fields[1], filename_len) != 0) {
+            printf("Failed to copy resolved filename\n");
+        } else {
+            *out_port = (int)port_val;
+            status = 0;
+        }
+    }
+
+    protocol_free_message(&resp);
+    free(raw);
+    return status;
+}
+
+static int client_connect_to_storage(const char *ip, int port) {
+    if (!ip || !is_valid_port(port)) {
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        printf("Failed to create socket to Storage Server\n");
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+        printf("Invalid Storage Server IP address\n");
+        close(fd);
+        return -1;
+    }
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        printf("Failed to connect to Storage Server %s:%d\n", ip, port);
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+static int client_receive_read_stream(int ss_fd, const char *display_name) {
+    int saw_start = 0;
+    int content_printed = 0;
+    int last_char_newline = 1;
+
+    while (1) {
+        char *raw = protocol_receive_message(ss_fd);
+        if (!raw) {
+            printf("Connection lost while reading file\n");
+            return -1;
+        }
+
+        ProtocolMessage msg;
+        if (protocol_parse_message(raw, &msg) != 0 || msg.field_count == 0) {
+            free(raw);
+            printf("Received malformed response from Storage Server\n");
+            return -1;
+        }
+
+        if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        const char *type = msg.fields[0];
+        if (strcmp(type, RESP_OK_READ_START) == 0) {
+            const char *name = (msg.field_count >= 2 && msg.fields[1][0]) ? msg.fields[1] : display_name;
+            if (name && name[0]) {
+                printf("---- %s ----\n", name);
+            } else {
+                printf("---- File ----\n");
+            }
+            saw_start = 1;
+        } else if (strcmp(type, RESP_OK_CONTENT) == 0) {
+            if (msg.field_count >= 2) {
+                const char *payload = msg.fields[1];
+                size_t len = strlen(payload);
+                if (len > 0) {
+                    fwrite(payload, 1, len, stdout);
+                    content_printed = 1;
+                    last_char_newline = (payload[len - 1] == '\n');
+                }
+            }
+        } else if (strcmp(type, RESP_OK_READ_END) == 0) {
+            if (!saw_start) {
+                printf("Unexpected READ_END without READ_START\n");
+                protocol_free_message(&msg);
+                free(raw);
+                return -1;
+            }
+            if (!content_printed) {
+                printf("(empty file)\n");
+            } else if (!last_char_newline) {
+                printf("\n");
+            }
+            fflush(stdout);
+            protocol_free_message(&msg);
+            free(raw);
+            return 0;
+        } else {
+            printf("Unexpected response from Storage Server: %s\n", type);
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+}
+
+static int client_handle_read(Client *client, const char *filename) {
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    char location_ip[MAX_IP_LENGTH] = {0};
+    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+    int location_port = 0;
+    if (client_request_location(client, "READ", filename,
+                                location_ip, sizeof(location_ip),
+                                &location_port, resolved_filename,
+                                sizeof(resolved_filename)) != 0) {
+        return -1;
+    }
+
+    int ss_fd = client_connect_to_storage(location_ip, location_port);
+    if (ss_fd < 0) {
+        return -1;
+    }
+
+    const char *req_fields[] = {MSG_REQ_READ, client->username, resolved_filename[0] ? resolved_filename : filename};
+    char *req = protocol_build_message(req_fields, 3);
+    if (!req) {
+        close(ss_fd);
+        return -1;
+    }
+
+    if (protocol_send_message(ss_fd, req) < 0) {
+        printf("Failed to send READ request to Storage Server\n");
+        free(req);
+        close(ss_fd);
+        return -1;
+    }
+    free(req);
+
+    int rc = client_receive_read_stream(ss_fd, resolved_filename[0] ? resolved_filename : filename);
+    close(ss_fd);
+    return rc;
 }
 
 int client_start(Client *client) {

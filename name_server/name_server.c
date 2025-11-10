@@ -576,6 +576,42 @@ static int file_remove_access(FileMetadata *file, const char *username) {
     return removed;
 }
 
+static int file_has_read_access(const FileMetadata *file, const char *username) {
+    if (!file || !username) {
+        return 0;
+    }
+
+    if (strncmp(file->owner, username, MAX_USERNAME_LENGTH) == 0) {
+        return 1;
+    }
+
+    if (file_acl_contains(file->read_access_users, file->read_access_count, username)) {
+        return 1;
+    }
+
+    if (file_acl_contains(file->write_access_users, file->write_access_count, username)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int file_has_write_access(const FileMetadata *file, const char *username) {
+    if (!file || !username) {
+        return 0;
+    }
+
+    if (strncmp(file->owner, username, MAX_USERNAME_LENGTH) == 0) {
+        return 1;
+    }
+
+    if (file_acl_contains(file->write_access_users, file->write_access_count, username)) {
+        return 1;
+    }
+
+    return 0;
+}
+
 static int parse_permission_flags(const char *perm, int *grant_read, int *grant_write) {
     if (!perm || !grant_read || !grant_write) {
         return -1;
@@ -1043,44 +1079,70 @@ static void run_client_loop(ConnectionContext *ctx) {
                 }
             }
         } else if (strcmp(command, MSG_REQ_LOC) == 0) {
-            if (cmd_msg.field_count < 2) {
-                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in location request.", ctx->peer_ip, ctx->peer_port);
+            const char *operation = NULL;
+            const char *filename = NULL;
+            if (cmd_msg.field_count >= 3) {
+                operation = cmd_msg.fields[1];
+                filename = cmd_msg.fields[2];
+            } else if (cmd_msg.field_count >= 2) {
+                operation = "READ";
+                filename = cmd_msg.fields[1];
             } else {
-                const char *filename = cmd_msg.fields[1];
-                if (!validate_filename(filename)) {
-                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename requested.", ctx->peer_ip, ctx->peer_port);
-                } else {
-                    FileMetadata file_copy;
-                    int found = 0;
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in location request.", ctx->peer_ip, ctx->peer_port);
+                protocol_free_message(&cmd_msg);
+                free(raw_command);
+                continue;
+            }
 
-                    pthread_mutex_lock(&ns->state_lock);
-                    int file_index = -1;
-                    if (file_cache_lookup(ns, filename, &file_copy, &file_index)) {
-                        found = 1;
+            if (!validate_filename(filename)) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename requested.", ctx->peer_ip, ctx->peer_port);
+            } else if (ctx->username[0] == '\0') {
+                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                FileMetadata file_snapshot;
+                int have_access = 0;
+                int file_exists = 0;
+                int operation_known = 1;
+
+                pthread_mutex_lock(&ns->state_lock);
+                FileIndexNode *node = file_index_find(ns, filename);
+                if (node && node->file_array_index >= 0 && node->file_array_index < ns->file_count) {
+                    FileMetadata *file = &ns->files[node->file_array_index];
+                    file_exists = 1;
+
+                    if (!operation || operation[0] == '\0' || strcasecmp(operation, "READ") == 0) {
+                        have_access = file_has_read_access(file, ctx->username);
+                    } else if (strcasecmp(operation, "WRITE") == 0) {
+                        have_access = file_has_write_access(file, ctx->username);
+                    } else if (strcasecmp(operation, "STREAM") == 0) {
+                        have_access = file_has_read_access(file, ctx->username);
                     } else {
-                        FileIndexNode *node = file_index_find(ns, filename);
-                        if (node && node->file_array_index >= 0 && node->file_array_index < ns->file_count) {
-                            file_index = node->file_array_index;
-                            file_copy = ns->files[file_index];
-                            file_cache_store(ns, filename, file_index);
-                            found = 1;
-                        }
+                        operation_known = 0;
                     }
-                    pthread_mutex_unlock(&ns->state_lock);
 
-                    if (found) {
-                        char port_buf[16];
-                        snprintf(port_buf, sizeof(port_buf), "%d", file_copy.ss_port);
-                        const char *resp_fields[] = {RESP_OK_LOC, filename, file_copy.ss_ip, port_buf};
-                        char *resp = protocol_build_message(resp_fields, 4);
-                        if (resp) {
-                            protocol_send_message(ctx->conn_fd, resp);
-                            free(resp);
-                        } else {
-                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build OK_LOC response.", ctx->peer_ip, ctx->peer_port);
-                        }
+                    if (operation_known && have_access) {
+                        file_snapshot = *file;
+                        file_cache_store(ns, filename, node->file_array_index);
+                    }
+                }
+                pthread_mutex_unlock(&ns->state_lock);
+
+                if (!operation_known) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Unsupported location request operation.", ctx->peer_ip, ctx->peer_port);
+                } else if (!file_exists) {
+                    send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "Requested file not found.", ctx->peer_ip, ctx->peer_port);
+                } else if (!have_access) {
+                    send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "User lacks required access.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    char port_buf[16];
+                    snprintf(port_buf, sizeof(port_buf), "%d", file_snapshot.ss_port);
+                    const char *resp_fields[] = {RESP_OK_LOC, file_snapshot.filename, file_snapshot.ss_ip, port_buf};
+                    char *resp = protocol_build_message(resp_fields, 4);
+                    if (resp) {
+                        protocol_send_message(ctx->conn_fd, resp);
+                        free(resp);
                     } else {
-                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "Requested file not found.", ctx->peer_ip, ctx->peer_port);
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build OK_LOC response.", ctx->peer_ip, ctx->peer_port);
                     }
                 }
             }
