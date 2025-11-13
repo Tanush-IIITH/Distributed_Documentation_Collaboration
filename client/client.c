@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -16,11 +17,13 @@ static int client_handle_create(Client *client, const char *filename);
 static int client_handle_delete(Client *client, const char *filename);
 static int client_handle_info(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
+static int client_handle_write(Client *client, const char *filename, int sentence_index);
 static int client_request_location(Client *client, const char *operation, const char *filename,
                                    char *out_ip, size_t ip_len, int *out_port,
                                    char *out_filename, size_t filename_len);
 static int client_connect_to_storage(const char *ip, int port);
 static int client_receive_read_stream(int ss_fd, const char *display_name);
+static int client_receive_ss_message(int fd, ProtocolMessage *out_msg, char **out_raw);
 
 int client_init(Client *client, const char *username, const char *ns_ip, int ns_port) {
     if (!client || !username || !ns_ip) {
@@ -174,7 +177,17 @@ int client_process_command(Client *client, const char *input) {
         }
         return client_handle_create(client, filename);
     } else if (strcasecmp(command, "WRITE") == 0) {
-        // TODO: handle WRITE <filename> <sentence_number>
+        char filename[MAX_FILENAME_LENGTH];
+        int sentence_index = -1;
+        if (sscanf(input, "%*s %511s %d", filename, &sentence_index) != 2) {
+            printf("Usage: WRITE <filename> <sentence_index>\n");
+            return -1;
+        }
+        if (sentence_index < 0) {
+            printf("Sentence index must be a non-negative integer.\n");
+            return -1;
+        }
+        return client_handle_write(client, filename, sentence_index);
     } else if (strcasecmp(command, "UNDO") == 0) {
         // TODO: handle UNDO <filename>
     } else if (strcasecmp(command, "INFO") == 0) {
@@ -265,6 +278,25 @@ static int client_read_response(Client *client, ProtocolMessage *out_msg, char *
         return -1;
     }
     if (protocol_parse_message(raw, out_msg) != 0) {
+        free(raw);
+        return -1;
+    }
+
+    *out_raw = raw;
+    return 0;
+}
+
+static int client_receive_ss_message(int fd, ProtocolMessage *out_msg, char **out_raw) {
+    if (fd < 0 || !out_msg || !out_raw) {
+        return -1;
+    }
+
+    char *raw = protocol_receive_message(fd);
+    if (!raw) {
+        return -1;
+    }
+
+    if (protocol_parse_message(raw, out_msg) != 0 || out_msg->field_count == 0) {
         free(raw);
         return -1;
     }
@@ -757,6 +789,298 @@ static int client_connect_to_storage(const char *ip, int port) {
     }
 
     return fd;
+}
+
+static int client_handle_write(Client *client, const char *filename, int sentence_index) {
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    if (sentence_index < 0) {
+        printf("Sentence index must be a non-negative integer.\n");
+        return -1;
+    }
+
+    char location_ip[MAX_IP_LENGTH] = {0};
+    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+    int location_port = 0;
+    if (client_request_location(client, "WRITE", filename,
+                                location_ip, sizeof(location_ip),
+                                &location_port, resolved_filename,
+                                sizeof(resolved_filename)) != 0) {
+        return -1;
+    }
+
+    int ss_fd = client_connect_to_storage(location_ip, location_port);
+    if (ss_fd < 0) {
+        return -1;
+    }
+
+    int rc = -1;
+    char *current_sentence = NULL;
+    char locked_filename[MAX_FILENAME_LENGTH] = {0};
+    int locked_sentence_index = sentence_index;
+    const char *target_filename = resolved_filename[0] ? resolved_filename : filename;
+
+    char sentence_buf[32];
+    snprintf(sentence_buf, sizeof(sentence_buf), "%d", sentence_index);
+    const char *lock_fields[] = {MSG_REQ_WRITE_LOCK, client->username, target_filename, sentence_buf};
+    char *lock_msg = protocol_build_message(lock_fields, 4);
+    if (!lock_msg) {
+        printf("Failed to build WRITE lock request.\n");
+        goto cleanup;
+    }
+
+    if (protocol_send_message(ss_fd, lock_msg) < 0) {
+        printf("Failed to send WRITE lock request to Storage Server.\n");
+        free(lock_msg);
+        goto cleanup;
+    }
+    free(lock_msg);
+
+    int got_lock = 0;
+    int got_content = 0;
+    while (!got_lock || !got_content) {
+        ProtocolMessage msg;
+        char *raw = NULL;
+        if (client_receive_ss_message(ss_fd, &msg, &raw) != 0) {
+            printf("Connection lost while acquiring write lock.\n");
+            goto cleanup;
+        }
+
+        if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            goto cleanup;
+        }
+
+        const char *type = msg.fields[0];
+        if (strcmp(type, RESP_OK_LOCKED) == 0) {
+            got_lock = 1;
+            if (msg.field_count >= 2 && msg.fields[1]) {
+                safe_strcpy(locked_filename, msg.fields[1], sizeof(locked_filename));
+            }
+            if (msg.field_count >= 3 && msg.fields[2]) {
+                char *endptr = NULL;
+                long idx_val = strtol(msg.fields[2], &endptr, 10);
+                if (endptr && *endptr == '\0' && idx_val >= 0 && idx_val <= INT_MAX) {
+                    locked_sentence_index = (int)idx_val;
+                }
+            }
+        } else if (strcmp(type, RESP_OK_CONTENT) == 0) {
+            got_content = 1;
+            const char *payload = (msg.field_count >= 2 && msg.fields[1]) ? msg.fields[1] : "";
+            current_sentence = strdup(payload);
+            if (!current_sentence) {
+                printf("Failed to allocate memory for sentence copy.\n");
+                protocol_free_message(&msg);
+                free(raw);
+                goto cleanup;
+            }
+        } else {
+            printf("Unexpected response from Storage Server: %s\n", type ? type : "<unknown>");
+            protocol_free_message(&msg);
+            free(raw);
+            goto cleanup;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    const char *display_name = locked_filename[0] ? locked_filename : target_filename;
+    printf("Locked sentence %d in %s.\n", locked_sentence_index, display_name);
+    printf("Current sentence: %s\n", current_sentence && current_sentence[0] ? current_sentence : "(empty)");
+    printf("Enter '<word_index> <content>' to edit, or 'ETIRW' to finalize.\n");
+    printf("Word indices start at 0; punctuation marks (., !, ?) mark sentence boundaries.\n");
+
+    char input_line[CLIENT_BUFFER_SIZE];
+    int session_active = 1;
+
+    while (session_active) {
+        printf("write> ");
+        fflush(stdout);
+
+        if (!fgets(input_line, sizeof(input_line), stdin)) {
+            printf("\nInput closed; aborting write session.\n");
+            goto cleanup;
+        }
+
+        size_t len = strlen(input_line);
+        if (len > 0 && input_line[len - 1] == '\n') {
+            input_line[len - 1] = '\0';
+        }
+
+        char *cursor = input_line;
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+
+        if (*cursor == '\0') {
+            continue;
+        }
+
+        if (strcmp(cursor, MSG_ETIRW) == 0) {
+            const char *etirw_fields[] = {MSG_ETIRW};
+            char *etirw_msg = protocol_build_message(etirw_fields, 1);
+            if (!etirw_msg) {
+                printf("Failed to build ETIRW message.\n");
+                goto cleanup;
+            }
+
+            if (protocol_send_message(ss_fd, etirw_msg) < 0) {
+                printf("Failed to send ETIRW to Storage Server.\n");
+                free(etirw_msg);
+                goto cleanup;
+            }
+            free(etirw_msg);
+
+            while (1) {
+                ProtocolMessage msg;
+                char *raw = NULL;
+                if (client_receive_ss_message(ss_fd, &msg, &raw) != 0) {
+                    printf("Connection lost while finalizing write.\n");
+                    goto cleanup;
+                }
+
+                if (protocol_is_error(&msg)) {
+                    client_print_ns_response(&msg);
+                    protocol_free_message(&msg);
+                    free(raw);
+                    break;
+                }
+
+                const char *type = msg.fields[0];
+                if (strcmp(type, RESP_OK_WRITE_DONE) == 0) {
+                    printf("Write committed successfully.\n");
+                    protocol_free_message(&msg);
+                    free(raw);
+                    rc = 0;
+                    session_active = 0;
+                    goto cleanup;
+                } else if (strcmp(type, RESP_OK_CONTENT) == 0) {
+                    if (msg.field_count >= 2 && msg.fields[1]) {
+                        free(current_sentence);
+                        current_sentence = strdup(msg.fields[1]);
+                        if (current_sentence) {
+                            printf("Current sentence: %s\n",
+                                   current_sentence[0] ? current_sentence : "(empty)");
+                        }
+                    }
+                } else if (strcmp(type, RESP_OK) == 0) {
+                    if (msg.field_count >= 2) {
+                        printf("%s\n", msg.fields[1]);
+                    } else {
+                        printf("OK\n");
+                    }
+                } else {
+                    printf("Unexpected response from Storage Server: %s\n", type);
+                }
+
+                protocol_free_message(&msg);
+                free(raw);
+            }
+
+            continue;
+        }
+
+        errno = 0;
+        char *endptr = NULL;
+        long idx_val = strtol(cursor, &endptr, 10);
+        if (endptr == cursor || errno != 0 || idx_val < 0 || idx_val > INT_MAX) {
+            printf("Invalid word index. Use a non-negative integer.\n");
+            continue;
+        }
+        int word_index = (int)idx_val;
+
+        while (*endptr == ' ' || *endptr == '\t') {
+            endptr++;
+        }
+        const char *content = endptr;
+
+        char word_buf[32];
+        snprintf(word_buf, sizeof(word_buf), "%d", word_index);
+        const char *write_fields[] = {MSG_WRITE_DATA, word_buf, content};
+        char *write_msg = protocol_build_message(write_fields, 3);
+        if (!write_msg) {
+            printf("Failed to build WRITE_DATA message.\n");
+            continue;
+        }
+
+        if (protocol_send_message(ss_fd, write_msg) < 0) {
+            printf("Failed to send WRITE_DATA to Storage Server.\n");
+            free(write_msg);
+            goto cleanup;
+        }
+        free(write_msg);
+
+        while (1) {
+            ProtocolMessage msg;
+            char *raw = NULL;
+            if (client_receive_ss_message(ss_fd, &msg, &raw) != 0) {
+                printf("Connection lost while applying edit.\n");
+                goto cleanup;
+            }
+
+            if (protocol_is_error(&msg)) {
+                client_print_ns_response(&msg);
+                protocol_free_message(&msg);
+                free(raw);
+                break;
+            }
+
+            const char *type = msg.fields[0];
+            if (strcmp(type, RESP_OK) == 0) {
+                if (msg.field_count >= 2) {
+                    printf("%s\n", msg.fields[1]);
+                } else {
+                    printf("Edit applied.\n");
+                }
+                protocol_free_message(&msg);
+                free(raw);
+                break;
+            } else if (strcmp(type, RESP_OK_CONTENT) == 0) {
+                if (msg.field_count >= 2 && msg.fields[1]) {
+                    free(current_sentence);
+                    current_sentence = strdup(msg.fields[1]);
+                    if (current_sentence) {
+                        printf("Current sentence: %s\n",
+                               current_sentence[0] ? current_sentence : "(empty)");
+                    }
+                }
+            } else if (strcmp(type, RESP_OK_WRITE_DONE) == 0) {
+                printf("Write committed on server.\n");
+                protocol_free_message(&msg);
+                free(raw);
+                rc = 0;
+                session_active = 0;
+                goto cleanup;
+            } else {
+                printf("Unexpected response from Storage Server: %s\n", type);
+                protocol_free_message(&msg);
+                free(raw);
+                break;
+            }
+
+            protocol_free_message(&msg);
+            free(raw);
+        }
+    }
+
+cleanup:
+    if (current_sentence) {
+        free(current_sentence);
+    }
+    if (ss_fd >= 0) {
+        close(ss_fd);
+    }
+    return rc;
 }
 
 static int client_receive_read_stream(int ss_fd, const char *display_name) {
