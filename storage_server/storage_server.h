@@ -28,9 +28,6 @@ typedef struct FileRecord {
     char last_access_user[MAX_USERNAME_LENGTH];
     int undo_available;
     pthread_mutex_t file_lock;
-    int sentence_locked;
-    int locked_sentence_index;
-    char lock_owner[MAX_USERNAME_LENGTH];
     struct FileRecord *next;
 } FileRecord;
 

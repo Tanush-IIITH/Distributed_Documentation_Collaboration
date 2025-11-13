@@ -34,6 +34,8 @@ static int ss_acl_remove(char entries[][MAX_USERNAME_LENGTH], int *count, const 
 static int ss_get_sentence_bounds(const char *text, int sentence_index,
                                   size_t *start_out, size_t *end_out);
 static int ss_apply_word_edit(WriteSession *session, int word_index, const char *content);
+static WriteSession *ss_find_session_by_sentence(StorageServer *ss, FileRecord *rec, int sentence_index);
+static int ss_file_has_active_writers(StorageServer *ss, FileRecord *rec);
 
 typedef struct {
     StorageServer *ss;
@@ -112,7 +114,6 @@ static void ss_init_file_record(FileRecord *rec, const char *filename, const cha
     build_path(rec->undopath, sizeof(rec->undopath), base_path, undo_name);
 
     pthread_mutex_init(&rec->file_lock, NULL);
-    rec->locked_sentence_index = -1;
 }
 
 static int ss_load_metadata(FileRecord *rec) {
@@ -124,10 +125,6 @@ static int ss_load_metadata(FileRecord *rec) {
     rec->read_count = 0;
     rec->write_count = 0;
     rec->undo_available = 0;
-    rec->sentence_locked = 0;
-    rec->locked_sentence_index = -1;
-    rec->lock_owner[0] = '\0';
-
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
         trim_string(line);
@@ -296,6 +293,28 @@ static WriteSession *ss_find_session(StorageServer *ss, int client_fd) {
     return NULL;
 }
 
+static WriteSession *ss_find_session_by_sentence(StorageServer *ss, FileRecord *rec, int sentence_index) {
+    WriteSession *node = ss->sessions;
+    while (node) {
+        if (node->file == rec && node->sentence_index == sentence_index) {
+            return node;
+        }
+        node = node->next;
+    }
+    return NULL;
+}
+
+static int ss_file_has_active_writers(StorageServer *ss, FileRecord *rec) {
+    WriteSession *node = ss->sessions;
+    while (node) {
+        if (node->file == rec) {
+            return 1;
+        }
+        node = node->next;
+    }
+    return 0;
+}
+
 static void ss_free_session(WriteSession *session) {
     if (!session) {
         return;
@@ -335,17 +354,6 @@ static void ss_abort_session(StorageServer *ss, int client_fd) {
 
     if (!session) {
         return;
-    }
-
-    FileRecord *rec = session->file;
-    if (rec) {
-        pthread_mutex_lock(&rec->file_lock);
-        if (rec->sentence_locked && strncmp(rec->lock_owner, session->username, MAX_USERNAME_LENGTH) == 0) {
-            rec->sentence_locked = 0;
-            rec->locked_sentence_index = -1;
-            rec->lock_owner[0] = '\0';
-        }
-        pthread_mutex_unlock(&rec->file_lock);
     }
 
     ss_free_session(session);
@@ -1500,7 +1508,11 @@ static void handle_client_write_lock(StorageServer *ss, int fd, ProtocolMessage 
     pthread_mutex_lock(&rec->file_lock);
     pthread_mutex_unlock(&ss->files_lock);
 
-    if (rec->sentence_locked && strncmp(rec->lock_owner, username, MAX_USERNAME_LENGTH) != 0) {
+    pthread_mutex_lock(&ss->sessions_lock);
+    WriteSession *existing = ss_find_session_by_sentence(ss, rec, sentence_index);
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    if (existing) {
         pthread_mutex_unlock(&rec->file_lock);
         send_error_response(fd, ERR_SENTENCE_LOCKED, "Sentence already locked");
         return;
@@ -1552,10 +1564,6 @@ static void handle_client_write_lock(StorageServer *ss, int fd, ProtocolMessage 
         send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to create write session");
         return;
     }
-
-    rec->sentence_locked = 1;
-    rec->locked_sentence_index = sentence_index;
-    safe_strcpy(rec->lock_owner, username, sizeof(rec->lock_owner));
 
     const char *lock_fields[] = {RESP_OK_LOCKED, rec->filename, msg->fields[3]};
     char *lock_msg = protocol_build_message(lock_fields, 3);
@@ -1619,43 +1627,58 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
 
     pthread_mutex_lock(&rec->file_lock);
 
-    if (!rec->sentence_locked || strncmp(rec->lock_owner, session->username, MAX_USERNAME_LENGTH) != 0) {
-        pthread_mutex_unlock(&rec->file_lock);
-        send_error_response(fd, ERR_INVALID_REQUEST, "Sentence lock lost");
-        return;
-    }
-
-    const char *snapshot = session->file_snapshot ? session->file_snapshot : "";
     const char *replacement = session->sentence_working ? session->sentence_working : "";
-
     char username_copy[MAX_USERNAME_LENGTH];
     safe_strcpy(username_copy, session->username, sizeof(username_copy));
 
-    size_t snapshot_len = strlen(snapshot);
-    size_t replacement_len = strlen(replacement);
-    if (session->sentence_start > snapshot_len || session->sentence_end > snapshot_len || session->sentence_start > session->sentence_end) {
+    char *current_snapshot = ss_read_file_content(rec->filepath);
+    if (!current_snapshot) {
         pthread_mutex_unlock(&rec->file_lock);
-        send_error_response(fd, ERR_INTERNAL_ERROR, "Corrupted session bounds");
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to read file");
         return;
     }
 
-    size_t new_len = session->sentence_start + replacement_len + (snapshot_len - session->sentence_end);
+    size_t cur_start = 0;
+    size_t cur_end = 0;
+    if (ss_get_sentence_bounds(current_snapshot, session->sentence_index, &cur_start, &cur_end) != 0) {
+        free(current_snapshot);
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INVALID_REQUEST, "Sentence layout changed; restart WRITE");
+        pthread_mutex_lock(&ss->sessions_lock);
+        WriteSession *detached = ss_detach_session(ss, fd);
+        pthread_mutex_unlock(&ss->sessions_lock);
+        ss_free_session(detached);
+        return;
+    }
+
+    size_t base_len = strlen(current_snapshot);
+    size_t replacement_len = strlen(replacement);
+    if (cur_start > base_len || cur_end > base_len || cur_start > cur_end) {
+        free(current_snapshot);
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Invalid sentence bounds");
+        return;
+    }
+
+    size_t new_len = cur_start + replacement_len + (base_len - cur_end);
     char *new_content = (char *)safe_malloc(new_len + 1);
     if (!new_content) {
+        free(current_snapshot);
         pthread_mutex_unlock(&rec->file_lock);
         send_error_response(fd, ERR_INTERNAL_ERROR, "Memory allocation failed");
         return;
     }
 
-    memcpy(new_content, snapshot, session->sentence_start);
-    memcpy(new_content + session->sentence_start, replacement, replacement_len);
-    memcpy(new_content + session->sentence_start + replacement_len,
-           snapshot + session->sentence_end,
-           snapshot_len - session->sentence_end);
+    memcpy(new_content, current_snapshot, cur_start);
+    memcpy(new_content + cur_start, replacement, replacement_len);
+    memcpy(new_content + cur_start + replacement_len,
+           current_snapshot + cur_end,
+           base_len - cur_end);
     new_content[new_len] = '\0';
 
-    if (ss_write_file_content(rec->undopath, snapshot) != 0) {
+    if (ss_write_file_content(rec->undopath, current_snapshot) != 0) {
         free(new_content);
+        free(current_snapshot);
         pthread_mutex_unlock(&rec->file_lock);
         send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to persist undo");
         return;
@@ -1663,6 +1686,7 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
 
     if (ss_write_file_content(rec->filepath, new_content) != 0) {
         free(new_content);
+        free(current_snapshot);
         pthread_mutex_unlock(&rec->file_lock);
         send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to write file");
         return;
@@ -1673,16 +1697,14 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
     rec->undo_available = 1;
     ss_touch_file_metadata(rec, session->username, 1);
 
-    rec->sentence_locked = 0;
-    rec->locked_sentence_index = -1;
-    rec->lock_owner[0] = '\0';
-
     pthread_mutex_unlock(&rec->file_lock);
 
     pthread_mutex_lock(&ss->sessions_lock);
     WriteSession *detached = ss_detach_session(ss, fd);
     ss_free_session(detached);
     pthread_mutex_unlock(&ss->sessions_lock);
+
+    free(current_snapshot);
 
     const char *fields[] = {RESP_OK_WRITE_DONE};
     char *resp = protocol_build_message(fields, 1);
@@ -1720,7 +1742,11 @@ static void handle_client_undo(StorageServer *ss, int fd, ProtocolMessage *msg) 
     pthread_mutex_lock(&rec->file_lock);
     pthread_mutex_unlock(&ss->files_lock);
 
-    if (rec->sentence_locked) {
+    pthread_mutex_lock(&ss->sessions_lock);
+    int writers_active = ss_file_has_active_writers(ss, rec);
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    if (writers_active) {
         pthread_mutex_unlock(&rec->file_lock);
         send_error_response(fd, ERR_SENTENCE_LOCKED, "File locked for writing");
         return;
@@ -1973,13 +1999,6 @@ void ss_cleanup(StorageServer *ss) {
 
     while (pending) {
         WriteSession *next = pending->next;
-        if (pending->file) {
-            pthread_mutex_lock(&pending->file->file_lock);
-            pending->file->sentence_locked = 0;
-            pending->file->locked_sentence_index = -1;
-            pending->file->lock_owner[0] = '\0';
-            pthread_mutex_unlock(&pending->file->file_lock);
-        }
         ss_free_session(pending);
         pending = next;
     }
