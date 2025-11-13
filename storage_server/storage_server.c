@@ -1158,6 +1158,17 @@ static void free_words(char **words, int count) {
 }
 
 static char *join_words(char **words, int count, char delimiter_char) {
+    int ends_with_delimiter = 0;
+    if (count > 0) {
+        const char *last_word = words[count - 1];
+        if (last_word) {
+            size_t last_len = strlen(last_word);
+            if (last_len > 0 && is_sentence_delimiter(last_word[last_len - 1])) {
+                ends_with_delimiter = 1;
+            }
+        }
+    }
+
     size_t total = 0;
     for (int i = 0; i < count; i++) {
         if (words[i]) {
@@ -1167,7 +1178,7 @@ static char *join_words(char **words, int count, char delimiter_char) {
             total++; // space
         }
     }
-    if (delimiter_char) {
+    if (delimiter_char && !ends_with_delimiter) {
         total++;
     }
     char *result = (char *)safe_malloc(total + 1);
@@ -1183,7 +1194,7 @@ static char *join_words(char **words, int count, char delimiter_char) {
             safe_strcat(result, words[i], total + 1);
         }
     }
-    if (delimiter_char) {
+    if (delimiter_char && !ends_with_delimiter) {
         size_t len = strlen(result);
         result[len] = delimiter_char;
         result[len + 1] = '\0';
@@ -1276,17 +1287,9 @@ static int ss_apply_word_edit(WriteSession *session, int word_index, const char 
 
     free(buffer);
 
-    if (word_index > word_count) {
+    if (word_index > word_count + 1) {
         free_words(words, word_count);
         return -1;
-    }
-
-    if (word_index < word_count) {
-        free(words[word_index]);
-        for (int i = word_index; i < word_count - 1; i++) {
-            words[i] = words[i + 1];
-        }
-        word_count--;
     }
 
     char **new_words = NULL;
@@ -1297,20 +1300,28 @@ static int ss_apply_word_edit(WriteSession *session, int word_index, const char 
     }
 
     if (new_count > 0) {
-        char **expanded = (char **)realloc(words, (size_t)(word_count + new_count) * sizeof(char *));
+        int original_count = word_count;
+        int insert_pos = word_index;
+        if (word_index > original_count) {
+            insert_pos = original_count;
+        }
+
+        char **expanded = (char **)realloc(words, (size_t)(original_count + new_count) * sizeof(char *));
         if (!expanded) {
             free_words(words, word_count);
             free_words(new_words, new_count);
             return -1;
         }
         words = expanded;
-        for (int i = word_count - 1; i >= word_index; i--) {
-            words[i + new_count] = words[i];
+        if (insert_pos < original_count) {
+            memmove(&words[insert_pos + new_count],
+                    &words[insert_pos],
+                    (size_t)(original_count - insert_pos) * sizeof(char *));
         }
         for (int i = 0; i < new_count; i++) {
-            words[word_index + i] = new_words[i];
+            words[insert_pos + i] = new_words[i];
         }
-        word_count += new_count;
+        word_count = original_count + new_count;
         free(new_words);
     } else {
         free(new_words);
