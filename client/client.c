@@ -17,6 +17,7 @@ static int client_handle_create(Client *client, const char *filename);
 static int client_handle_delete(Client *client, const char *filename);
 static int client_handle_info(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
+static int client_handle_undo(Client *client, const char *filename);
 static int client_handle_write(Client *client, const char *filename, int sentence_index);
 static int client_request_location(Client *client, const char *operation, const char *filename,
                                    char *out_ip, size_t ip_len, int *out_port,
@@ -189,7 +190,12 @@ int client_process_command(Client *client, const char *input) {
         }
         return client_handle_write(client, filename, sentence_index);
     } else if (strcasecmp(command, "UNDO") == 0) {
-        // TODO: handle UNDO <filename>
+        char filename[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", filename) != 1) {
+            printf("Usage: UNDO <filename>\n");
+            return -1;
+        }
+        return client_handle_undo(client, filename);
     } else if (strcasecmp(command, "INFO") == 0) {
         char filename[MAX_FILENAME_LENGTH];
         if (sscanf(input, "%*s %511s", filename) != 1) {
@@ -1197,6 +1203,64 @@ static int client_handle_read(Client *client, const char *filename) {
     free(req);
 
     int rc = client_receive_read_stream(ss_fd, resolved_filename[0] ? resolved_filename : filename);
+    close(ss_fd);
+    return rc;
+}
+
+static int client_handle_undo(Client *client, const char *filename) {
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    char location_ip[MAX_IP_LENGTH] = {0};
+    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+    int location_port = 0;
+    if (client_request_location(client, "WRITE", filename,
+                                location_ip, sizeof(location_ip),
+                                &location_port, resolved_filename,
+                                sizeof(resolved_filename)) != 0) {
+        return -1;
+    }
+
+    int ss_fd = client_connect_to_storage(location_ip, location_port);
+    if (ss_fd < 0) {
+        return -1;
+    }
+
+    const char *target_filename = resolved_filename[0] ? resolved_filename : filename;
+    const char *req_fields[] = {MSG_REQ_UNDO, client->username, target_filename};
+    char *req = protocol_build_message(req_fields, 3);
+    if (!req) {
+        close(ss_fd);
+        return -1;
+    }
+
+    if (protocol_send_message(ss_fd, req) < 0) {
+        printf("Failed to send UNDO request to Storage Server\n");
+        free(req);
+        close(ss_fd);
+        return -1;
+    }
+    free(req);
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_receive_ss_message(ss_fd, &resp, &raw) != 0) {
+        printf("Connection lost waiting for UNDO response.\n");
+        close(ss_fd);
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    int rc = protocol_is_error(&resp) ? -1 : 0;
+
+    protocol_free_message(&resp);
+    free(raw);
     close(ss_fd);
     return rc;
 }
