@@ -18,12 +18,14 @@ static int client_handle_delete(Client *client, const char *filename);
 static int client_handle_info(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
 static int client_handle_undo(Client *client, const char *filename);
+static int client_handle_stream(Client *client, const char *filename);
 static int client_handle_write(Client *client, const char *filename, int sentence_index);
 static int client_request_location(Client *client, const char *operation, const char *filename,
                                    char *out_ip, size_t ip_len, int *out_port,
                                    char *out_filename, size_t filename_len);
 static int client_connect_to_storage(const char *ip, int port);
 static int client_receive_read_stream(int ss_fd, const char *display_name);
+static int client_receive_word_stream(int ss_fd, const char *display_name);
 static int client_receive_ss_message(int fd, ProtocolMessage *out_msg, char **out_raw);
 
 int client_init(Client *client, const char *username, const char *ns_ip, int ns_port) {
@@ -211,7 +213,12 @@ int client_process_command(Client *client, const char *input) {
         }
         return client_handle_delete(client, filename);
     } else if (strcasecmp(command, "STREAM") == 0) {
-        // TODO: handle STREAM <filename>
+        char filename[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", filename) != 1) {
+            printf("Usage: STREAM <filename>\n");
+            return -1;
+        }
+        return client_handle_stream(client, filename);
     } else if (strcasecmp(command, "LIST") == 0) {
         return client_handle_list(client);
     } else if (strcasecmp(command, "ADDACCESS") == 0) {
@@ -1162,6 +1169,66 @@ static int client_receive_read_stream(int ss_fd, const char *display_name) {
     }
 }
 
+static int client_receive_word_stream(int ss_fd, const char *display_name) {
+    int saw_start = 0;
+    int content_printed = 0;
+
+    while (1) {
+        char *raw = protocol_receive_message(ss_fd);
+        if (!raw) {
+            printf("\nConnection lost while streaming file\n");
+            return -1;
+        }
+
+        ProtocolMessage msg;
+        if (protocol_parse_message(raw, &msg) != 0 || msg.field_count == 0) {
+            free(raw);
+            printf("\nReceived malformed response from Storage Server\n");
+            return -1;
+        }
+
+        if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        const char *type = msg.fields[0];
+        if (strcmp(type, RESP_OK_STREAM) == 0) {
+            const char *name = (msg.field_count >= 2 && msg.fields[1][0]) ? msg.fields[1] : display_name;
+            printf("--- Streaming %s ---\n", name && name[0] ? name : "file");
+            saw_start = 1;
+        } else if (strcmp(type, RESP_OK_CONTENT) == 0) {
+            if (msg.field_count >= 2 && msg.fields[1]) {
+                printf("%s ", msg.fields[1]);
+                fflush(stdout);
+                content_printed = 1;
+            }
+        } else if (strcmp(type, RESP_OK_STREAM_END) == 0) {
+            if (!saw_start) {
+                printf("Unexpected STREAM_END without STREAM_START\n");
+            }
+            if (!content_printed) {
+                printf("(empty file)");
+            }
+            printf("\n--- End of Stream ---\n");
+            fflush(stdout);
+            protocol_free_message(&msg);
+            free(raw);
+            return 0;
+        } else {
+            printf("\nUnexpected response from Storage Server: %s\n", type ? type : "<unknown>");
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+}
+
 static int client_handle_read(Client *client, const char *filename) {
     if (!client || client->ns_sockfd < 0 || !filename) {
         return -1;
@@ -1261,6 +1328,52 @@ static int client_handle_undo(Client *client, const char *filename) {
 
     protocol_free_message(&resp);
     free(raw);
+    close(ss_fd);
+    return rc;
+}
+
+static int client_handle_stream(Client *client, const char *filename) {
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    char location_ip[MAX_IP_LENGTH] = {0};
+    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+    int location_port = 0;
+    if (client_request_location(client, "STREAM", filename,
+                                location_ip, sizeof(location_ip),
+                                &location_port, resolved_filename,
+                                sizeof(resolved_filename)) != 0) {
+        return -1;
+    }
+
+    int ss_fd = client_connect_to_storage(location_ip, location_port);
+    if (ss_fd < 0) {
+        return -1;
+    }
+
+    const char *target_filename = resolved_filename[0] ? resolved_filename : filename;
+    const char *req_fields[] = {MSG_REQ_STREAM, client->username, target_filename};
+    char *req = protocol_build_message(req_fields, 3);
+    if (!req) {
+        close(ss_fd);
+        return -1;
+    }
+
+    if (protocol_send_message(ss_fd, req) < 0) {
+        printf("Failed to send STREAM request to Storage Server\n");
+        free(req);
+        close(ss_fd);
+        return -1;
+    }
+    free(req);
+
+    int rc = client_receive_word_stream(ss_fd, target_filename);
     close(ss_fd);
     return rc;
 }
