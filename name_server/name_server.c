@@ -1163,6 +1163,165 @@ static void run_client_loop(ConnectionContext *ctx) {
                     free(ss_resp_raw);
                 }
             }
+        } else if (strcmp(command, MSG_EXEC) == 0) {
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in EXEC.", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+                if (!validate_filename(filename)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    StorageServerInfo *target_ss = NULL;
+                    int target_ss_acquired = 0;
+                    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+                    char *ss_resp_raw = NULL;
+                    ProtocolMessage content_msg;
+                    int content_msg_valid = 0;
+                    FILE *pipe = NULL;
+
+                    do {
+                        pthread_mutex_lock(&ns->state_lock);
+                        FileIndexNode *node = file_index_find(ns, filename);
+                        if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                            pthread_mutex_unlock(&ns->state_lock);
+                            send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found.", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        FileMetadata file_snapshot = ns->files[node->file_array_index];
+                        if (!file_has_read_access(&file_snapshot, ctx->username)) {
+                            pthread_mutex_unlock(&ns->state_lock);
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "User lacks read access for EXEC.", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        if (safe_strcpy(resolved_filename, file_snapshot.filename, sizeof(resolved_filename)) != 0) {
+                            pthread_mutex_unlock(&ns->state_lock);
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to resolve filename for EXEC.", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        for (int i = 0; i < ns->ss_count; i++) {
+                            StorageServerInfo *candidate = ns->storage_servers[i];
+                            if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
+                                continue;
+                            }
+                            if (strncmp(candidate->client_ip, file_snapshot.ss_ip, MAX_IP_LENGTH) == 0 &&
+                                candidate->client_port == file_snapshot.ss_port) {
+                                target_ss = candidate;
+                                storage_server_acquire(target_ss);
+                                target_ss_acquired = 1;
+                                break;
+                            }
+                        }
+
+                        pthread_mutex_unlock(&ns->state_lock);
+
+                        if (!target_ss) {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server for file is offline.", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        const char *content_fields[] = {MSG_GET_CONTENT, resolved_filename};
+                        int ss_status = storage_server_send_and_wait(target_ss, content_fields, 2, &ss_resp_raw);
+                        storage_server_release(target_ss);
+                        target_ss_acquired = 0;
+
+                        if (ss_status != 0) {
+                            const char *detail = "Failed to get file content from storage server.";
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, detail, ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        if (!ss_resp_raw || protocol_parse_message(ss_resp_raw, &content_msg) != 0 || content_msg.field_count == 0) {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Malformed storage server response.", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+                        content_msg_valid = 1;
+
+                        if (protocol_is_error(&content_msg)) {
+                            int err_code = protocol_get_error_code(&content_msg);
+                            const char *detail = (content_msg.field_count >= 3) ? content_msg.fields[2] : "Storage server error.";
+                            send_error_and_log(ctx->conn_fd, err_code, detail, ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        if (strcmp(content_msg.fields[0], RESP_OK_CONTENT) != 0 || content_msg.field_count < 3) {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected storage server payload for EXEC.", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        const char *file_content = content_msg.fields[2] ? content_msg.fields[2] : "";
+                        pipe = popen(file_content, "r");
+                        if (!pipe) {
+                            send_error_and_log(ctx->conn_fd, ERR_EXEC_FAILED, "Failed to execute command on server.", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        int send_failed = 0;
+                        const char *start_fields[] = {RESP_OK_EXEC_START};
+                        char *resp = protocol_build_message(start_fields, 1);
+                        if (!resp || protocol_send_message(ctx->conn_fd, resp) < 0) {
+                            send_failed = 1;
+                        }
+                        if (resp) {
+                            free(resp);
+                        }
+
+                        char line_buf[MAX_FIELD_SIZE];
+                        while (!send_failed && fgets(line_buf, sizeof(line_buf), pipe) != NULL) {
+                            trim_string(line_buf);
+                            const char *line_fields[] = {RESP_EXEC_OUT, line_buf};
+                            resp = protocol_build_message(line_fields, 2);
+                            if (!resp) {
+                                send_failed = 1;
+                                break;
+                            }
+                            if (protocol_send_message(ctx->conn_fd, resp) < 0) {
+                                send_failed = 1;
+                            }
+                            free(resp);
+                        }
+
+                        if (pipe) {
+                            pclose(pipe);
+                            pipe = NULL;
+                        }
+
+                        if (!send_failed) {
+                            const char *end_fields[] = {RESP_OK_EXEC_END};
+                            resp = protocol_build_message(end_fields, 1);
+                            if (!resp || protocol_send_message(ctx->conn_fd, resp) < 0) {
+                                send_failed = 1;
+                            }
+                            if (resp) {
+                                free(resp);
+                            }
+                        }
+
+                        if (send_failed) {
+                            log_message(LOG_WARNING, "NS", "EXEC streaming interrupted for %s:%d", ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            log_message(LOG_INFO, "NS", "Executed '%s' for %s", resolved_filename, ctx->username);
+                        }
+                    } while (0);
+
+                    if (pipe) {
+                        pclose(pipe);
+                    }
+                    if (content_msg_valid) {
+                        protocol_free_message(&content_msg);
+                    }
+                    if (ss_resp_raw) {
+                        free(ss_resp_raw);
+                    }
+                    if (target_ss_acquired && target_ss) {
+                        storage_server_release(target_ss);
+                    }
+                }
+            }
         } else if (strcmp(command, MSG_CREATE) == 0) {
             // Handle the CREATE command: validate input, update metadata, and coordinate with storage servers
 
@@ -1898,7 +2057,7 @@ static void run_ss_loop(ConnectionContext *ctx) {
         }
 
         if (strcmp(file_msg.fields[0], MSG_SS_HAS_FILE) == 0) {
-            if (file_msg.field_count < 5) {
+            if (file_msg.field_count < 3) {
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Incomplete SS_HAS_FILE message.", ctx->peer_ip, ctx->peer_port);
                 protocol_free_message(&file_msg);
                 free(file_msg_raw);
@@ -1906,9 +2065,9 @@ static void run_ss_loop(ConnectionContext *ctx) {
             }
 
             const char *filename = file_msg.fields[1];
-            const char *owner = file_msg.fields[2] ? file_msg.fields[2] : "";
-            const char *read_acl_csv = file_msg.fields[3] ? file_msg.fields[3] : "";
-            const char *write_acl_csv = file_msg.fields[4] ? file_msg.fields[4] : "";
+            const char *owner = (file_msg.field_count >= 3 && file_msg.fields[2]) ? file_msg.fields[2] : "";
+            const char *read_acl_csv = (file_msg.field_count >= 4 && file_msg.fields[3]) ? file_msg.fields[3] : "";
+            const char *write_acl_csv = (file_msg.field_count >= 5 && file_msg.fields[4]) ? file_msg.fields[4] : "";
             if (!validate_filename(filename)) {
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename received from storage server.", ctx->peer_ip, ctx->peer_port);
                 protocol_free_message(&file_msg);

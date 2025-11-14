@@ -19,6 +19,7 @@ static int client_handle_info(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
 static int client_handle_undo(Client *client, const char *filename);
 static int client_handle_stream(Client *client, const char *filename);
+static int client_handle_exec(Client *client, const char *filename);
 static int client_handle_write(Client *client, const char *filename, int sentence_index);
 static int client_request_location(Client *client, const char *operation, const char *filename,
                                    char *out_ip, size_t ip_len, int *out_port,
@@ -239,7 +240,12 @@ int client_process_command(Client *client, const char *input) {
         }
         return client_handle_remaccess(client, filename, target);
     } else if (strcasecmp(command, "EXEC") == 0) {
-        // TODO: handle EXEC <filename>
+        char filename[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", filename) != 1) {
+            printf("Usage: EXEC <filename>\n");
+            return -1;
+        }
+        return client_handle_exec(client, filename);
     } else if (strcasecmp(command, "CREATEFOLDER") == 0) {
         // TODO: handle CREATEFOLDER <foldername>
     } else if (strcasecmp(command, "MOVE") == 0) {
@@ -1376,6 +1382,83 @@ static int client_handle_stream(Client *client, const char *filename) {
     int rc = client_receive_word_stream(ss_fd, target_filename);
     close(ss_fd);
     return rc;
+}
+
+static int client_handle_exec(Client *client, const char *filename) {
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    const char *fields[] = {MSG_EXEC, filename};
+    char *message = protocol_build_message(fields, 2);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send EXEC command\n");
+        return -1;
+    }
+
+    int saw_start = 0;
+
+    while (1) {
+        ProtocolMessage msg;
+        char *raw = NULL;
+        if (client_read_response(client, &msg, &raw) != 0) {
+            printf("Connection lost during EXEC.\n");
+            return -1;
+        }
+
+        if (msg.field_count == 0) {
+            printf("Malformed response from Name Server during EXEC.\n");
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        const char *type = msg.fields[0];
+
+        if (strcmp(type, RESP_OK_EXEC_START) == 0) {
+            saw_start = 1;
+        } else if (strcmp(type, RESP_EXEC_OUT) == 0) {
+            if (msg.field_count >= 2 && msg.fields[1]) {
+                printf("%s\n", msg.fields[1]);
+                fflush(stdout);
+            }
+        } else if (strcmp(type, RESP_OK_EXEC_END) == 0) {
+            protocol_free_message(&msg);
+            free(raw);
+            break;
+        } else {
+            printf("Unexpected response from server: %s\n", type ? type : "<unknown>");
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    if (!saw_start) {
+        printf("EXEC sequence missing start acknowledgement.\n");
+        return -1;
+    }
+
+    return 0;
 }
 
 int client_start(Client *client) {
