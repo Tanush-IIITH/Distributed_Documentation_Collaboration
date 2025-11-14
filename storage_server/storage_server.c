@@ -31,6 +31,7 @@ static int ss_check_write_access(FileRecord *rec, const char *user);
 static int ss_acl_contains(const char entries[][MAX_USERNAME_LENGTH], int count, const char *username);
 static int ss_acl_add(char entries[][MAX_USERNAME_LENGTH], int *count, const char *username);
 static int ss_acl_remove(char entries[][MAX_USERNAME_LENGTH], int *count, const char *username);
+static int ss_join_acl(const char entries[][MAX_USERNAME_LENGTH], int count, char *buffer, size_t buffer_size);
 static int ss_get_sentence_bounds(const char *text, int sentence_index,
                                   size_t *start_out, size_t *end_out);
 static int ss_apply_word_edit(WriteSession *session, int word_index, const char *content);
@@ -463,8 +464,20 @@ static int ss_emit_file_list(StorageServer *ss) {
     FileRecord *node = ss->files;
     while (node) {
         const char *owner = node->owner[0] ? node->owner : "";
-        const char *fields[] = {MSG_SS_HAS_FILE, node->filename, owner};
-        char *msg = protocol_build_message(fields, 3);
+        char read_acl_buf[MAX_FIELD_SIZE] = {0};
+        char write_acl_buf[MAX_FIELD_SIZE] = {0};
+
+        if (ss_join_acl((const char (*)[MAX_USERNAME_LENGTH])node->read_users, node->read_count, read_acl_buf, sizeof(read_acl_buf)) != 0) {
+            log_message(LOG_ERROR, "SS", "Failed to serialize read ACL for %s", node->filename);
+            read_acl_buf[0] = '\0';
+        }
+        if (ss_join_acl((const char (*)[MAX_USERNAME_LENGTH])node->write_users, node->write_count, write_acl_buf, sizeof(write_acl_buf)) != 0) {
+            log_message(LOG_ERROR, "SS", "Failed to serialize write ACL for %s", node->filename);
+            write_acl_buf[0] = '\0';
+        }
+
+        const char *fields[] = {MSG_SS_HAS_FILE, node->filename, owner, read_acl_buf, write_acl_buf};
+        char *msg = protocol_build_message(fields, 5);
         if (!msg) {
             pthread_mutex_unlock(&ss->files_lock);
             return -1;
@@ -931,6 +944,35 @@ static int ss_acl_remove(char entries[][MAX_USERNAME_LENGTH], int *count, const 
         }
     }
 
+    return 0;
+}
+
+static int ss_join_acl(const char entries[][MAX_USERNAME_LENGTH], int count, char *buffer, size_t buffer_size) {
+    if (!buffer || buffer_size == 0) {
+        return -1;
+    }
+
+    buffer[0] = '\0';
+    if (!entries || count <= 0) {
+        return 0;
+    }
+
+    size_t offset = 0;
+    for (int i = 0; i < count; i++) {
+        size_t len = strnlen(entries[i], MAX_USERNAME_LENGTH);
+        if (len == 0) {
+            continue;
+        }
+        if (offset + len + (offset > 0 ? 1 : 0) >= buffer_size) {
+            return -1;
+        }
+        if (offset > 0) {
+            buffer[offset++] = ',';
+        }
+        memcpy(buffer + offset, entries[i], len);
+        offset += len;
+    }
+    buffer[offset] = '\0';
     return 0;
 }
 

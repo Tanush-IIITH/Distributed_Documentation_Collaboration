@@ -1898,8 +1898,8 @@ static void run_ss_loop(ConnectionContext *ctx) {
         }
 
         if (strcmp(file_msg.fields[0], MSG_SS_HAS_FILE) == 0) {
-            if (file_msg.field_count < 3) {
-                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename or owner missing in SS_HAS_FILE.", ctx->peer_ip, ctx->peer_port);
+            if (file_msg.field_count < 5) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Incomplete SS_HAS_FILE message.", ctx->peer_ip, ctx->peer_port);
                 protocol_free_message(&file_msg);
                 free(file_msg_raw);
                 continue;
@@ -1907,8 +1907,8 @@ static void run_ss_loop(ConnectionContext *ctx) {
 
             const char *filename = file_msg.fields[1];
             const char *owner = file_msg.fields[2] ? file_msg.fields[2] : "";
-            const char *read_acl_csv = (file_msg.field_count >= 4 && file_msg.fields[3]) ? file_msg.fields[3] : "";
-            const char *write_acl_csv = (file_msg.field_count >= 5 && file_msg.fields[4]) ? file_msg.fields[4] : "";
+            const char *read_acl_csv = file_msg.fields[3] ? file_msg.fields[3] : "";
+            const char *write_acl_csv = file_msg.fields[4] ? file_msg.fields[4] : "";
             if (!validate_filename(filename)) {
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename received from storage server.", ctx->peer_ip, ctx->peer_port);
                 protocol_free_message(&file_msg);
