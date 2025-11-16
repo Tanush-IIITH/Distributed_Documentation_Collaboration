@@ -1646,6 +1646,14 @@ static void run_client_loop(ConnectionContext *ctx) {
                         have_access = file_has_write_access(file, ctx->username);
                     } else if (strcasecmp(operation, "STREAM") == 0) {
                         have_access = file_has_read_access(file, ctx->username);
+                    } else if (strcasecmp(operation, "CHECKPOINT") == 0) {
+                        have_access = file_has_write_access(file, ctx->username);
+                    } else if (strcasecmp(operation, "REVERT") == 0) {
+                        have_access = file_has_write_access(file, ctx->username);
+                    } else if (strcasecmp(operation, "VIEWCHECKPOINT") == 0) {
+                        have_access = file_has_read_access(file, ctx->username);
+                    } else if (strcasecmp(operation, "LISTCHECKPOINTS") == 0) {
+                        have_access = file_has_read_access(file, ctx->username);
                     } else {
                         operation_known = 0;
                     }

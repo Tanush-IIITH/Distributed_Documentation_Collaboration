@@ -37,6 +37,15 @@ static int ss_get_sentence_bounds(const char *text, int sentence_index,
 static int ss_apply_word_edit(WriteSession *session, int word_index, const char *content);
 static WriteSession *ss_find_session_by_sentence(StorageServer *ss, FileRecord *rec, int sentence_index);
 static int ss_file_has_active_writers(StorageServer *ss, FileRecord *rec);
+static int ss_file_exists(const char *path);
+static int ss_copy_file(const char *src_path, const char *dest_path);
+static void ss_sanitize_tag(const char *tag, char *buffer, size_t size);
+static CheckpointRecord *ss_find_checkpoint(FileRecord *rec, const char *tag);
+static void ss_prune_oldest_checkpoint(FileRecord *rec);
+static void handle_client_checkpoint(StorageServer *ss, int fd, ProtocolMessage *msg);
+static void handle_client_viewcheckpoint(StorageServer *ss, int fd, ProtocolMessage *msg);
+static void handle_client_revert(StorageServer *ss, int fd, ProtocolMessage *msg);
+static void handle_client_listcheckpoints(StorageServer *ss, int fd, ProtocolMessage *msg);
 
 typedef struct {
     StorageServer *ss;
@@ -101,6 +110,110 @@ static int dirent_is_directory(const char *base_path, const struct dirent *entry
     return 0;
 }
 
+static int ss_file_exists(const char *path) {
+    if (!path || !path[0]) {
+        return 0;
+    }
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static int ss_copy_file(const char *src_path, const char *dest_path) {
+    if (!src_path || !dest_path) {
+        return -1;
+    }
+
+    FILE *src = fopen(src_path, "rb");
+    if (!src) {
+        return -1;
+    }
+
+    FILE *dest = fopen(dest_path, "wb");
+    if (!dest) {
+        fclose(src);
+        return -1;
+    }
+
+    char buffer[4096];
+    size_t bytes_read;
+    int rc = 0;
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+        if (fwrite(buffer, 1, bytes_read, dest) != bytes_read) {
+            rc = -1;
+            break;
+        }
+    }
+
+    if (ferror(src)) {
+        rc = -1;
+    }
+
+    fclose(src);
+    fclose(dest);
+
+    if (rc != 0) {
+        unlink(dest_path);
+    }
+
+    return rc;
+}
+
+static void ss_sanitize_tag(const char *tag, char *buffer, size_t size) {
+    if (!buffer || size == 0) {
+        return;
+    }
+
+    buffer[0] = '\0';
+    if (!tag) {
+        return;
+    }
+
+    size_t out_idx = 0;
+    for (const char *ptr = tag; *ptr && out_idx + 1 < size; ptr++) {
+        unsigned char ch = (unsigned char)*ptr;
+        if (isalnum(ch) || ch == '_' || ch == '-') {
+            buffer[out_idx++] = (char)ch;
+        } else if (!isspace(ch)) {
+            buffer[out_idx++] = '_';
+        } else {
+            buffer[out_idx++] = '-';
+        }
+    }
+    buffer[out_idx] = '\0';
+}
+
+static CheckpointRecord *ss_find_checkpoint(FileRecord *rec, const char *tag) {
+    if (!rec || !tag || !tag[0]) {
+        return NULL;
+    }
+
+    for (int i = 0; i < rec->checkpoint_count; i++) {
+        if (strncmp(rec->checkpoints[i].tag, tag, sizeof(rec->checkpoints[i].tag)) == 0) {
+            return &rec->checkpoints[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void ss_prune_oldest_checkpoint(FileRecord *rec) {
+    if (!rec || rec->checkpoint_count <= 0) {
+        return;
+    }
+
+    CheckpointRecord *oldest = &rec->checkpoints[0];
+    if (oldest->filepath[0]) {
+        unlink(oldest->filepath);
+    }
+
+    if (rec->checkpoint_count > 1) {
+        memmove(&rec->checkpoints[0], &rec->checkpoints[1],
+                (size_t)(rec->checkpoint_count - 1) * sizeof(CheckpointRecord));
+    }
+
+    rec->checkpoint_count--;
+}
+
 static void ss_init_file_record(FileRecord *rec, const char *filename, const char *base_path) {
     memset(rec, 0, sizeof(FileRecord));
     safe_strcpy(rec->filename, filename, sizeof(rec->filename));
@@ -126,6 +239,7 @@ static int ss_load_metadata(FileRecord *rec) {
     rec->read_count = 0;
     rec->write_count = 0;
     rec->undo_available = 0;
+    rec->checkpoint_count = 0;
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
         trim_string(line);
@@ -163,6 +277,21 @@ static int ss_load_metadata(FileRecord *rec) {
             safe_strcpy(rec->last_access_user, line + 10, sizeof(rec->last_access_user));
         } else if (strncmp(line, "UNDO=", 5) == 0) {
             rec->undo_available = atoi(line + 5);
+        } else if (strncmp(line, "CHECKPOINT=", 11) == 0) {
+            if (rec->checkpoint_count < SS_MAX_CHECKPOINTS) {
+                char *tag = line + 11;
+                char *filepath = strchr(tag, ':');
+                if (filepath) {
+                    *filepath = '\0';
+                    filepath++;
+                    trim_string(tag);
+                    trim_string(filepath);
+                    CheckpointRecord *ckpt = &rec->checkpoints[rec->checkpoint_count];
+                    safe_strcpy(ckpt->tag, tag, sizeof(ckpt->tag));
+                    safe_strcpy(ckpt->filepath, filepath, sizeof(ckpt->filepath));
+                    rec->checkpoint_count++;
+                }
+            }
         }
     }
 
@@ -194,6 +323,10 @@ static int ss_write_metadata(FileRecord *rec) {
         fprintf(fp, "%s%s", rec->write_users[i], (i + 1 < rec->write_count) ? "," : "");
     }
     fprintf(fp, "\n");
+
+    for (int i = 0; i < rec->checkpoint_count && i < SS_MAX_CHECKPOINTS; i++) {
+        fprintf(fp, "CHECKPOINT=%s:%s\n", rec->checkpoints[i].tag, rec->checkpoints[i].filepath);
+    }
 
     fclose(fp);
     return 0;
@@ -1769,6 +1902,328 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
     log_message(LOG_INFO, "SS", "Write committed on %s by %s", rec->filename, username_copy);
 }
 
+static void handle_client_checkpoint(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 4) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_CHECKPOINT");
+        return;
+    }
+
+    const char *username = msg->fields[1];
+    const char *filename = msg->fields[2];
+    const char *tag = msg->fields[3];
+
+    char tag_copy[MAX_TAG_LENGTH];
+    if (safe_strcpy(tag_copy, tag, sizeof(tag_copy)) != 0) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint tag too long");
+        return;
+    }
+    trim_string(tag_copy);
+    if (tag_copy[0] == '\0') {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint tag cannot be empty");
+        return;
+    }
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, filename);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_FILE_NOT_FOUND, "File not found");
+        return;
+    }
+
+    if (!ss_check_write_access(rec, username)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_PERMISSION_DENIED, "No write access");
+        return;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    pthread_mutex_lock(&ss->sessions_lock);
+    int writers_active = ss_file_has_active_writers(ss, rec);
+    pthread_mutex_unlock(&ss->sessions_lock);
+    if (writers_active) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_SENTENCE_LOCKED, "File locked for writing");
+        return;
+    }
+
+    if (ss_find_checkpoint(rec, tag_copy)) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint already exists");
+        return;
+    }
+
+    char sanitized[MAX_TAG_LENGTH];
+    ss_sanitize_tag(tag_copy, sanitized, sizeof(sanitized));
+    if (sanitized[0] == '\0') {
+        safe_strcpy(sanitized, "checkpoint", sizeof(sanitized));
+    }
+
+    char ckpt_filename[MAX_FILENAME_LENGTH + MAX_TAG_LENGTH + 32];
+    snprintf(ckpt_filename, sizeof(ckpt_filename), "%s.ckpt_%lld_%s",
+             rec->filename, (long long)get_current_time(), sanitized);
+
+    char ckpt_path[MAX_PATH_LENGTH];
+    if (build_path(ckpt_path, sizeof(ckpt_path), ss->storage_path, ckpt_filename) != 0) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to build checkpoint path");
+        return;
+    }
+
+    if (ss_copy_file(rec->filepath, ckpt_path) != 0) {
+        unlink(ckpt_path);
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to persist checkpoint");
+        return;
+    }
+
+    if (rec->checkpoint_count >= SS_MAX_CHECKPOINTS) {
+        ss_prune_oldest_checkpoint(rec);
+    }
+
+    CheckpointRecord *slot = &rec->checkpoints[rec->checkpoint_count++];
+    safe_strcpy(slot->tag, tag_copy, sizeof(slot->tag));
+    safe_strcpy(slot->filepath, ckpt_path, sizeof(slot->filepath));
+
+    ss_touch_file_metadata(rec, username, 0);
+    pthread_mutex_unlock(&rec->file_lock);
+
+    char message[256];
+    snprintf(message, sizeof(message), "Checkpoint '%s' created.", tag_copy);
+    const char *fields[] = {RESP_OK_CHECKPOINT, message};
+    char *resp = protocol_build_message(fields, 2);
+    if (resp) {
+        protocol_send_message(fd, resp);
+        free(resp);
+    }
+
+    log_message(LOG_INFO, "SS", "Checkpoint %s created for %s by %s", tag_copy, rec->filename, username);
+}
+
+static void handle_client_viewcheckpoint(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 4) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_VIEWCHECKPOINT");
+        return;
+    }
+
+    const char *username = msg->fields[1];
+    const char *filename = msg->fields[2];
+    const char *tag = msg->fields[3];
+
+    char tag_copy[MAX_TAG_LENGTH];
+    if (safe_strcpy(tag_copy, tag, sizeof(tag_copy)) != 0) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint tag too long");
+        return;
+    }
+    trim_string(tag_copy);
+    if (!tag_copy[0]) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint tag cannot be empty");
+        return;
+    }
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, filename);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_FILE_NOT_FOUND, "File not found");
+        return;
+    }
+
+    if (!ss_check_read_access(rec, username)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_PERMISSION_DENIED, "No read access");
+        return;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    CheckpointRecord *ckpt = ss_find_checkpoint(rec, tag_copy);
+    if (!ckpt) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint not found");
+        return;
+    }
+
+    if (!ss_file_exists(ckpt->filepath)) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Checkpoint data missing");
+        return;
+    }
+
+    char *content = ss_read_file_content(ckpt->filepath);
+    if (!content) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to read checkpoint");
+        return;
+    }
+
+    char display_name[MAX_FILENAME_LENGTH + MAX_TAG_LENGTH + 4];
+    snprintf(display_name, sizeof(display_name), "%s [%s]", rec->filename, tag_copy);
+
+    const char *start_fields[] = {RESP_OK_READ_START, display_name};
+    char *start_msg = protocol_build_message(start_fields, 2);
+    if (start_msg) {
+        protocol_send_message(fd, start_msg);
+        free(start_msg);
+    }
+
+    const char *content_fields[] = {RESP_OK_CONTENT, content};
+    char *content_msg = protocol_build_message(content_fields, 2);
+    if (content_msg) {
+        protocol_send_message(fd, content_msg);
+        free(content_msg);
+    }
+
+    const char *end_fields[] = {RESP_OK_READ_END};
+    char *end_msg = protocol_build_message(end_fields, 1);
+    if (end_msg) {
+        protocol_send_message(fd, end_msg);
+        free(end_msg);
+    }
+
+    ss_touch_file_metadata(rec, username, 0);
+    pthread_mutex_unlock(&rec->file_lock);
+    free(content);
+}
+
+static void handle_client_revert(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 4) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_REVERT");
+        return;
+    }
+
+    const char *username = msg->fields[1];
+    const char *filename = msg->fields[2];
+    const char *tag = msg->fields[3];
+
+    char tag_copy[MAX_TAG_LENGTH];
+    if (safe_strcpy(tag_copy, tag, sizeof(tag_copy)) != 0) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint tag too long");
+        return;
+    }
+    trim_string(tag_copy);
+    if (!tag_copy[0]) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint tag cannot be empty");
+        return;
+    }
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, filename);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_FILE_NOT_FOUND, "File not found");
+        return;
+    }
+
+    if (!ss_check_write_access(rec, username)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_PERMISSION_DENIED, "No write access");
+        return;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    pthread_mutex_lock(&ss->sessions_lock);
+    int writers_active = ss_file_has_active_writers(ss, rec);
+    pthread_mutex_unlock(&ss->sessions_lock);
+    if (writers_active) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_SENTENCE_LOCKED, "File locked for writing");
+        return;
+    }
+
+    CheckpointRecord *ckpt = ss_find_checkpoint(rec, tag_copy);
+    if (!ckpt) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INVALID_REQUEST, "Checkpoint not found");
+        return;
+    }
+
+    if (!ss_file_exists(ckpt->filepath)) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Checkpoint data missing");
+        return;
+    }
+
+    if (ss_copy_file(rec->filepath, rec->undopath) != 0) {
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to create undo snapshot");
+        return;
+    }
+
+    if (ss_copy_file(ckpt->filepath, rec->filepath) != 0) {
+        ss_copy_file(rec->undopath, rec->filepath);
+        pthread_mutex_unlock(&rec->file_lock);
+        send_error_response(fd, ERR_INTERNAL_ERROR, "Failed to revert file");
+        return;
+    }
+
+    rec->undo_available = 1;
+    ss_touch_file_metadata(rec, username, 1);
+    pthread_mutex_unlock(&rec->file_lock);
+
+    char message[256];
+    snprintf(message, sizeof(message), "File reverted to '%s'.", tag_copy);
+    const char *fields[] = {RESP_OK_REVERT, message};
+    char *resp = protocol_build_message(fields, 2);
+    if (resp) {
+        protocol_send_message(fd, resp);
+        free(resp);
+    }
+
+    log_message(LOG_INFO, "SS", "File %s reverted to %s by %s", rec->filename, tag_copy, username);
+}
+
+static void handle_client_listcheckpoints(StorageServer *ss, int fd, ProtocolMessage *msg) {
+    if (msg->field_count < 3) {
+        send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_LIST_CHECKPOINTS");
+        return;
+    }
+
+    const char *username = msg->fields[1];
+    const char *filename = msg->fields[2];
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, filename);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_FILE_NOT_FOUND, "File not found");
+        return;
+    }
+
+    if (!ss_check_read_access(rec, username)) {
+        pthread_mutex_unlock(&ss->files_lock);
+        send_error_response(fd, ERR_PERMISSION_DENIED, "No read access");
+        return;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    for (int i = 0; i < rec->checkpoint_count; i++) {
+        const char *fields[] = {RESP_OK_LIST_CHECKPOINT, rec->checkpoints[i].tag};
+        char *msg_line = protocol_build_message(fields, 2);
+        if (msg_line) {
+            protocol_send_message(fd, msg_line);
+            free(msg_line);
+        }
+    }
+
+    const char *end_fields[] = {RESP_OK_LIST_CHECKPOINT_END};
+    char *end_msg = protocol_build_message(end_fields, 1);
+    if (end_msg) {
+        protocol_send_message(fd, end_msg);
+        free(end_msg);
+    }
+
+    ss_touch_file_metadata(rec, username, 0);
+    pthread_mutex_unlock(&rec->file_lock);
+}
+
 static void handle_client_undo(StorageServer *ss, int fd, ProtocolMessage *msg) {
     if (msg->field_count < 3) {
         send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_UNDO");
@@ -1874,6 +2329,14 @@ static void *client_thread(void *arg) {
             handle_client_etirw(ss, fd);
         } else if (strcmp(command, MSG_REQ_UNDO) == 0) {
             handle_client_undo(ss, fd, &msg);
+        } else if (strcmp(command, MSG_REQ_CHECKPOINT) == 0) {
+            handle_client_checkpoint(ss, fd, &msg);
+        } else if (strcmp(command, MSG_REQ_VIEWCHECKPOINT) == 0) {
+            handle_client_viewcheckpoint(ss, fd, &msg);
+        } else if (strcmp(command, MSG_REQ_REVERT) == 0) {
+            handle_client_revert(ss, fd, &msg);
+        } else if (strcmp(command, MSG_REQ_LIST_CHECKPOINTS) == 0) {
+            handle_client_listcheckpoints(ss, fd, &msg);
         } else {
             send_error_response(fd, ERR_INVALID_REQUEST, "Unsupported command");
         }

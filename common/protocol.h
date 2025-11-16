@@ -146,11 +146,13 @@
 #define MSG_VIEWFOLDER "VIEWFOLDER"
 
 // Checkpoints
-// C -> SS: REQ_CHECKPOINT|username|filename|tag_name\n
+// C -> SS: REQ_CHECKPOINT|username|filename|tag_name
 #define MSG_REQ_CHECKPOINT "REQ_CHECKPOINT"
-// C -> SS: REQ_REVERT|username|filename|tag_name\n
+// C -> SS: REQ_VIEWCHECKPOINT|username|filename|tag_name
+#define MSG_REQ_VIEWCHECKPOINT "REQ_VIEWCHECKPOINT"
+// C -> SS: REQ_REVERT|username|filename|tag_name
 #define MSG_REQ_REVERT "REQ_REVERT"
-// C -> SS: REQ_LIST_CHECKPOINTS|username|filename\n
+// C -> SS: REQ_LIST_CHECKPOINTS|username|filename
 #define MSG_REQ_LIST_CHECKPOINTS "REQ_LIST_CHECKPOINTS"
 
 // Fault Tolerance

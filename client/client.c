@@ -18,6 +18,10 @@ static int client_handle_delete(Client *client, const char *filename);
 static int client_handle_info(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
 static int client_handle_undo(Client *client, const char *filename);
+static int client_handle_checkpoint(Client *client, const char *filename, const char *tag);
+static int client_handle_revert(Client *client, const char *filename, const char *tag);
+static int client_handle_listcheckpoints(Client *client, const char *filename);
+static int client_handle_viewcheckpoint(Client *client, const char *filename, const char *tag);
 static int client_handle_stream(Client *client, const char *filename);
 static int client_handle_exec(Client *client, const char *filename);
 static int client_handle_write(Client *client, const char *filename, int sentence_index);
@@ -253,13 +257,33 @@ int client_process_command(Client *client, const char *input) {
     } else if (strcasecmp(command, "VIEWFOLDER") == 0) {
         // TODO: handle VIEWFOLDER <foldername>
     } else if (strcasecmp(command, "CHECKPOINT") == 0) {
-        // TODO: handle CHECKPOINT <filename> <checkpoint_tag>
+        char filename[MAX_FILENAME_LENGTH], tag[MAX_TAG_LENGTH];
+        if (sscanf(input, "%*s %511s %127s", filename, tag) != 2) {
+            printf("Usage: CHECKPOINT <filename> <tag>\n");
+            return -1;
+        }
+        return client_handle_checkpoint(client, filename, tag);
     } else if (strcasecmp(command, "VIEWCHECKPOINT") == 0) {
-        // TODO: handle VIEWCHECKPOINT <filename> <checkpoint_tag>
+        char filename[MAX_FILENAME_LENGTH], tag[MAX_TAG_LENGTH];
+        if (sscanf(input, "%*s %511s %127s", filename, tag) != 2) {
+            printf("Usage: VIEWCHECKPOINT <filename> <tag>\n");
+            return -1;
+        }
+        return client_handle_viewcheckpoint(client, filename, tag);
     } else if (strcasecmp(command, "REVERT") == 0) {
-        // TODO: handle REVERT <filename> <checkpoint_tag>
+        char filename[MAX_FILENAME_LENGTH], tag[MAX_TAG_LENGTH];
+        if (sscanf(input, "%*s %511s %127s", filename, tag) != 2) {
+            printf("Usage: REVERT <filename> <tag>\n");
+            return -1;
+        }
+        return client_handle_revert(client, filename, tag);
     } else if (strcasecmp(command, "LISTCHECKPOINTS") == 0) {
-        // TODO: handle LISTCHECKPOINTS <filename>
+        char filename[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", filename) != 1) {
+            printf("Usage: LISTCHECKPOINTS <filename>\n");
+            return -1;
+        }
+        return client_handle_listcheckpoints(client, filename);
     } else if (strcasecmp(command, "REQUESTACCESS") == 0) {
         // TODO: handle REQUESTACCESS <filename> <permission>
     } else if (strcasecmp(command, "APPROVEACCESS") == 0) {
@@ -1338,6 +1362,269 @@ static int client_handle_undo(Client *client, const char *filename) {
     return rc;
 }
 
+static int client_handle_checkpoint(Client *client, const char *filename, const char *tag) {
+    if (!client || client->ns_sockfd < 0 || !filename || !tag) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    if (!tag[0]) {
+        printf("Checkpoint tag cannot be empty.\n");
+        return -1;
+    }
+
+    char location_ip[MAX_IP_LENGTH] = {0};
+    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+    int location_port = 0;
+    if (client_request_location(client, "CHECKPOINT", filename,
+                                location_ip, sizeof(location_ip),
+                                &location_port, resolved_filename,
+                                sizeof(resolved_filename)) != 0) {
+        return -1;
+    }
+
+    int ss_fd = client_connect_to_storage(location_ip, location_port);
+    if (ss_fd < 0) {
+        return -1;
+    }
+
+    const char *target_filename = resolved_filename[0] ? resolved_filename : filename;
+    const char *req_fields[] = {MSG_REQ_CHECKPOINT, client->username, target_filename, tag};
+    char *req = protocol_build_message(req_fields, 4);
+    if (!req) {
+        close(ss_fd);
+        return -1;
+    }
+
+    if (protocol_send_message(ss_fd, req) < 0) {
+        printf("Failed to send CHECKPOINT request to Storage Server\n");
+        free(req);
+        close(ss_fd);
+        return -1;
+    }
+    free(req);
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_receive_ss_message(ss_fd, &resp, &raw) != 0) {
+        printf("Connection lost waiting for CHECKPOINT response.\n");
+        close(ss_fd);
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    int rc = protocol_is_error(&resp) ? -1 : 0;
+
+    protocol_free_message(&resp);
+    free(raw);
+    close(ss_fd);
+    return rc;
+}
+
+static int client_handle_revert(Client *client, const char *filename, const char *tag) {
+    if (!client || client->ns_sockfd < 0 || !filename || !tag) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    if (!tag[0]) {
+        printf("Checkpoint tag cannot be empty.\n");
+        return -1;
+    }
+
+    char location_ip[MAX_IP_LENGTH] = {0};
+    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+    int location_port = 0;
+    if (client_request_location(client, "REVERT", filename,
+                                location_ip, sizeof(location_ip),
+                                &location_port, resolved_filename,
+                                sizeof(resolved_filename)) != 0) {
+        return -1;
+    }
+
+    int ss_fd = client_connect_to_storage(location_ip, location_port);
+    if (ss_fd < 0) {
+        return -1;
+    }
+
+    const char *target_filename = resolved_filename[0] ? resolved_filename : filename;
+    const char *req_fields[] = {MSG_REQ_REVERT, client->username, target_filename, tag};
+    char *req = protocol_build_message(req_fields, 4);
+    if (!req) {
+        close(ss_fd);
+        return -1;
+    }
+
+    if (protocol_send_message(ss_fd, req) < 0) {
+        printf("Failed to send REVERT request to Storage Server\n");
+        free(req);
+        close(ss_fd);
+        return -1;
+    }
+    free(req);
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_receive_ss_message(ss_fd, &resp, &raw) != 0) {
+        printf("Connection lost waiting for REVERT response.\n");
+        close(ss_fd);
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    int rc = protocol_is_error(&resp) ? -1 : 0;
+
+    protocol_free_message(&resp);
+    free(raw);
+    close(ss_fd);
+    return rc;
+}
+
+static int client_handle_listcheckpoints(Client *client, const char *filename) {
+    if (!client || client->ns_sockfd < 0 || !filename) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    char location_ip[MAX_IP_LENGTH] = {0};
+    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+    int location_port = 0;
+    if (client_request_location(client, "LISTCHECKPOINTS", filename,
+                                location_ip, sizeof(location_ip),
+                                &location_port, resolved_filename,
+                                sizeof(resolved_filename)) != 0) {
+        return -1;
+    }
+
+    int ss_fd = client_connect_to_storage(location_ip, location_port);
+    if (ss_fd < 0) {
+        return -1;
+    }
+
+    const char *target_filename = resolved_filename[0] ? resolved_filename : filename;
+    const char *req_fields[] = {MSG_REQ_LIST_CHECKPOINTS, client->username, target_filename};
+    char *req = protocol_build_message(req_fields, 3);
+    if (!req) {
+        close(ss_fd);
+        return -1;
+    }
+
+    if (protocol_send_message(ss_fd, req) < 0) {
+        printf("Failed to send LISTCHECKPOINTS request to Storage Server\n");
+        free(req);
+        close(ss_fd);
+        return -1;
+    }
+    free(req);
+
+    printf("Checkpoints for %s:\n", target_filename);
+
+    while (1) {
+        ProtocolMessage msg;
+        char *raw = NULL;
+        if (client_receive_ss_message(ss_fd, &msg, &raw) != 0) {
+            printf("Connection lost while listing checkpoints.\n");
+            close(ss_fd);
+            return -1;
+        }
+
+        if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            close(ss_fd);
+            return -1;
+        }
+
+        const char *type = msg.fields[0];
+        if (strcmp(type, RESP_OK_LIST_CHECKPOINT) == 0) {
+            const char *tag_name = (msg.field_count > 1 && msg.fields[1]) ? msg.fields[1] : "(unknown)";
+            printf("  - %s\n", tag_name);
+        } else if (strcmp(type, RESP_OK_LIST_CHECKPOINT_END) == 0) {
+            protocol_free_message(&msg);
+            free(raw);
+            break;
+        } else {
+            printf("Unexpected response while listing checkpoints: %s\n", type ? type : "<unknown>");
+            protocol_free_message(&msg);
+            free(raw);
+            close(ss_fd);
+            return -1;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    close(ss_fd);
+    return 0;
+}
+
+static int client_handle_viewcheckpoint(Client *client, const char *filename, const char *tag) {
+    if (!client || client->ns_sockfd < 0 || !filename || !tag) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    if (!tag[0]) {
+        printf("Checkpoint tag cannot be empty.\n");
+        return -1;
+    }
+
+    char location_ip[MAX_IP_LENGTH] = {0};
+    char resolved_filename[MAX_FILENAME_LENGTH] = {0};
+    int location_port = 0;
+    if (client_request_location(client, "VIEWCHECKPOINT", filename,
+                                location_ip, sizeof(location_ip),
+                                &location_port, resolved_filename,
+                                sizeof(resolved_filename)) != 0) {
+        return -1;
+    }
+
+    int ss_fd = client_connect_to_storage(location_ip, location_port);
+    if (ss_fd < 0) {
+        return -1;
+    }
+
+    const char *target_filename = resolved_filename[0] ? resolved_filename : filename;
+    const char *req_fields[] = {MSG_REQ_VIEWCHECKPOINT, client->username, target_filename, tag};
+    char *req = protocol_build_message(req_fields, 4);
+    if (!req) {
+        close(ss_fd);
+        return -1;
+    }
+
+    if (protocol_send_message(ss_fd, req) < 0) {
+        printf("Failed to send VIEWCHECKPOINT request to Storage Server\n");
+        free(req);
+        close(ss_fd);
+        return -1;
+    }
+    free(req);
+
+    char display_name[MAX_FILENAME_LENGTH + MAX_TAG_LENGTH + 4];
+    snprintf(display_name, sizeof(display_name), "%s [%s]", target_filename, tag);
+    int rc = client_receive_read_stream(ss_fd, display_name);
+    close(ss_fd);
+    return rc;
+}
+
 static int client_handle_stream(Client *client, const char *filename) {
     if (!client || client->ns_sockfd < 0 || !filename) {
         return -1;
@@ -1505,6 +1792,10 @@ int client_start(Client *client) {
             printf("  LIST\n");
             printf("  ADDACCESS -R|-W <filename> <username>\n");
             printf("  REMACCESS <filename> <username>\n");
+            printf("  CHECKPOINT <filename> <tag>\n");
+            printf("  VIEWCHECKPOINT <filename> <tag>\n");
+            printf("  REVERT <filename> <tag>\n");
+            printf("  LISTCHECKPOINTS <filename>\n");
             printf("  quit/exit - Exit the client\n");
             continue;
         }

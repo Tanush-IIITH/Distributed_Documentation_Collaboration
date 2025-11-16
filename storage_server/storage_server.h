@@ -11,6 +11,12 @@
 #define SS_META_SUFFIX ".meta"
 #define SS_UNDO_SUFFIX ".undo"
 #define SS_MAX_USERS_PER_FILE 128
+#define SS_MAX_CHECKPOINTS 32
+
+typedef struct {
+    char tag[MAX_FILENAME_LENGTH];
+    char filepath[MAX_PATH_LENGTH];
+} CheckpointRecord;
 
 typedef struct FileRecord {
     char filename[MAX_FILENAME_LENGTH];
@@ -27,6 +33,8 @@ typedef struct FileRecord {
     time_t last_access;
     char last_access_user[MAX_USERNAME_LENGTH];
     int undo_available;
+    CheckpointRecord checkpoints[SS_MAX_CHECKPOINTS];
+    int checkpoint_count;
     pthread_mutex_t file_lock;
     struct FileRecord *next;
 } FileRecord;
