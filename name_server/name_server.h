@@ -9,6 +9,7 @@
 #define NS_MAX_STORAGE_SERVERS 100
 #define NS_MAX_CLIENTS 1000
 #define NS_MAX_FILES 10000
+#define NS_MAX_ACCESS_REQUESTS 1024
 
 // File metadata structure
 typedef struct {
@@ -69,6 +70,16 @@ typedef struct {
 
 #define FILE_CACHE_SIZE 64
 
+typedef struct {
+    int id;
+    char filename[MAX_FILENAME_LENGTH];
+    char from_user[MAX_USERNAME_LENGTH];
+    char to_user[MAX_USERNAME_LENGTH];
+    int grant_read;
+    int grant_write;
+    int is_pending;
+} AccessRequest;
+
 // Name Server structure
 typedef struct {
     int port; // Port number the Name Server listens on
@@ -82,6 +93,10 @@ typedef struct {
 
     FileMetadata files[NS_MAX_FILES]; // Array to store metadata of files managed by the Name Server
     int file_count; // Count of files currently managed by the Name Server
+
+    AccessRequest access_requests[NS_MAX_ACCESS_REQUESTS];
+    int request_count;
+    int next_request_id;
 
     pthread_mutex_t state_lock; // Mutex to protect shared state (e.g., storage_servers, clients, files)
 

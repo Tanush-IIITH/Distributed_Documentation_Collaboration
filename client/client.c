@@ -25,6 +25,10 @@ static int client_handle_viewcheckpoint(Client *client, const char *filename, co
 static int client_handle_stream(Client *client, const char *filename);
 static int client_handle_exec(Client *client, const char *filename);
 static int client_handle_write(Client *client, const char *filename, int sentence_index);
+static int client_handle_requestaccess(Client *client, const char *filename, const char *permission);
+static int client_handle_listrequests(Client *client);
+static int client_handle_approveaccess(Client *client, int request_id);
+static int client_handle_rejectaccess(Client *client, int request_id);
 static int client_request_location(Client *client, const char *operation, const char *filename,
                                    char *out_ip, size_t ip_len, int *out_port,
                                    char *out_filename, size_t filename_len);
@@ -226,6 +230,16 @@ int client_process_command(Client *client, const char *input) {
         return client_handle_stream(client, filename);
     } else if (strcasecmp(command, "LIST") == 0) {
         return client_handle_list(client);
+    } else if (strcasecmp(command, "REQUESTACCESS") == 0) {
+        char filename[MAX_FILENAME_LENGTH];
+        char perm[16];
+        if (sscanf(input, "%*s %511s %15s", filename, perm) != 2) {
+            printf("Usage: REQUESTACCESS <filename> <R|W|RW>\n");
+            return -1;
+        }
+        return client_handle_requestaccess(client, filename, perm);
+    } else if (strcasecmp(command, "LISTREQUESTS") == 0) {
+        return client_handle_listrequests(client);
     } else if (strcasecmp(command, "ADDACCESS") == 0) {
         char perm[16];
         char filename[MAX_FILENAME_LENGTH];
@@ -243,6 +257,28 @@ int client_process_command(Client *client, const char *input) {
             return -1;
         }
         return client_handle_remaccess(client, filename, target);
+    } else if (strcasecmp(command, "APPROVEACCESS") == 0) {
+        int request_id = -1;
+        if (sscanf(input, "%*s %d", &request_id) != 1) {
+            printf("Usage: APPROVEACCESS <request_id>\n");
+            return -1;
+        }
+        if (request_id <= 0) {
+            printf("Request ID must be a positive integer.\n");
+            return -1;
+        }
+        return client_handle_approveaccess(client, request_id);
+    } else if (strcasecmp(command, "REJECTACCESS") == 0) {
+        int request_id = -1;
+        if (sscanf(input, "%*s %d", &request_id) != 1) {
+            printf("Usage: REJECTACCESS <request_id>\n");
+            return -1;
+        }
+        if (request_id <= 0) {
+            printf("Request ID must be a positive integer.\n");
+            return -1;
+        }
+        return client_handle_rejectaccess(client, request_id);
     } else if (strcasecmp(command, "EXEC") == 0) {
         char filename[MAX_FILENAME_LENGTH];
         if (sscanf(input, "%*s %511s", filename) != 1) {
@@ -284,12 +320,6 @@ int client_process_command(Client *client, const char *input) {
             return -1;
         }
         return client_handle_listcheckpoints(client, filename);
-    } else if (strcasecmp(command, "REQUESTACCESS") == 0) {
-        // TODO: handle REQUESTACCESS <filename> <permission>
-    } else if (strcasecmp(command, "APPROVEACCESS") == 0) {
-        // TODO: handle APPROVEACCESS <filename> <username>
-    } else if (strcasecmp(command, "REJECTACCESS") == 0) {
-        // TODO: handle REJECTACCESS <filename> <username>
     } else {
         printf("Unknown command: %s\n", command);
         return -1;
@@ -568,6 +598,201 @@ static int client_handle_remaccess(Client *client, const char *filename, const c
     char *raw = NULL;
     if (client_read_response(client, &resp, &raw) != 0) {
         printf("No response from Name Server for REMACCESS\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    protocol_free_message(&resp);
+    free(raw);
+    return 0;
+}
+
+static int client_handle_requestaccess(Client *client, const char *filename, const char *permission) {
+    if (!client || client->ns_sockfd < 0) {
+        return -1;
+    }
+
+    if (!validate_filename(filename)) {
+        printf("Invalid filename.\n");
+        return -1;
+    }
+
+    char perm_buffer[16] = {0};
+    if (safe_strcpy(perm_buffer, permission, sizeof(perm_buffer)) != 0) {
+        printf("Permission flag is too long.\n");
+        return -1;
+    }
+
+    char *perm_token = perm_buffer;
+    while (*perm_token == '-') {
+        perm_token++;
+    }
+
+    for (char *p = perm_token; *p; ++p) {
+        if (*p >= 'a' && *p <= 'z') {
+            *p = (char)(*p - 'a' + 'A');
+        }
+        if (*p != 'R' && *p != 'W') {
+            printf("Permission must contain only R or W.\n");
+            return -1;
+        }
+    }
+
+    if (!perm_token[0]) {
+        printf("Permission flag must include R or W.\n");
+        return -1;
+    }
+
+    const char *fields[] = {MSG_REQUEST_ACCESS, filename, perm_token};
+    char *message = protocol_build_message(fields, 3);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send REQUESTACCESS command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for REQUESTACCESS\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    protocol_free_message(&resp);
+    free(raw);
+    return 0;
+}
+
+static int client_handle_listrequests(Client *client) {
+    if (!client || client->ns_sockfd < 0) {
+        return -1;
+    }
+
+    const char *fields[] = {MSG_LIST_REQUESTS};
+    char *message = protocol_build_message(fields, 1);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send LISTREQUESTS command\n");
+        return -1;
+    }
+
+    int printed_any = 0;
+    while (1) {
+        ProtocolMessage msg;
+        char *raw = NULL;
+        if (client_read_response(client, &msg, &raw) != 0) {
+            printf("Connection lost while listing requests\n");
+            return -1;
+        }
+
+        if (msg.field_count == 0) {
+            printf("Malformed response while listing requests\n");
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        if (strcmp(msg.fields[0], RESP_OK_REQUEST_LIST_END) == 0) {
+            protocol_free_message(&msg);
+            free(raw);
+            break;
+        }
+
+        if (strcmp(msg.fields[0], RESP_OK_REQUEST_LIST) == 0 && msg.field_count >= 5) {
+            printed_any = 1;
+            const char *req_id = msg.fields[1];
+            const char *filename = msg.fields[2];
+            const char *from_user = msg.fields[3];
+            const char *perm = msg.fields[4];
+            printf("  #%s %s -> %s (%s access)\n", req_id, from_user, filename, perm);
+        } else if (protocol_is_error(&msg)) {
+            client_print_ns_response(&msg);
+            protocol_free_message(&msg);
+            free(raw);
+            return -1;
+        }
+
+        protocol_free_message(&msg);
+        free(raw);
+    }
+
+    if (!printed_any) {
+        printf("No pending access requests.\n");
+    }
+
+    return 0;
+}
+
+static int client_handle_approveaccess(Client *client, int request_id) {
+    if (!client || client->ns_sockfd < 0) {
+        return -1;
+    }
+
+    if (request_id <= 0) {
+        printf("Request ID must be positive.\n");
+        return -1;
+    }
+
+    char id_buf[16];
+    snprintf(id_buf, sizeof(id_buf), "%d", request_id);
+    const char *fields[] = {MSG_APPROVE_ACCESS, id_buf};
+    char *message = protocol_build_message(fields, 2);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send APPROVEACCESS command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for APPROVEACCESS\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    protocol_free_message(&resp);
+    free(raw);
+    return 0;
+}
+
+static int client_handle_rejectaccess(Client *client, int request_id) {
+    if (!client || client->ns_sockfd < 0) {
+        return -1;
+    }
+
+    if (request_id <= 0) {
+        printf("Request ID must be positive.\n");
+        return -1;
+    }
+
+    char id_buf[16];
+    snprintf(id_buf, sizeof(id_buf), "%d", request_id);
+    const char *fields[] = {MSG_REJECT_ACCESS, id_buf};
+    char *message = protocol_build_message(fields, 2);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send REJECTACCESS command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for REJECTACCESS\n");
         return -1;
     }
 
@@ -1792,6 +2017,10 @@ int client_start(Client *client) {
             printf("  LIST\n");
             printf("  ADDACCESS -R|-W <filename> <username>\n");
             printf("  REMACCESS <filename> <username>\n");
+            printf("  REQUESTACCESS <filename> <R|W|RW>\n");
+            printf("  LISTREQUESTS\n");
+            printf("  APPROVEACCESS <request_id>\n");
+            printf("  REJECTACCESS <request_id>\n");
             printf("  CHECKPOINT <filename> <tag>\n");
             printf("  VIEWCHECKPOINT <filename> <tag>\n");
             printf("  REVERT <filename> <tag>\n");

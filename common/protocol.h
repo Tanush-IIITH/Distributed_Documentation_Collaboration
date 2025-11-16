@@ -65,6 +65,16 @@
 // C -> NS: REMACCESS|filename|username_to_remove\n
 #define MSG_REMACCESS "REMACCESS"
 
+// Mailbox commands
+// C -> NS: REQUESTACCESS|filename|permission
+#define MSG_REQUEST_ACCESS "REQUESTACCESS"
+// C -> NS: LISTREQUESTS
+#define MSG_LIST_REQUESTS "LISTREQUESTS"
+// C -> NS: APPROVEACCESS|request_id
+#define MSG_APPROVE_ACCESS "APPROVEACCESS"
+// C -> NS: REJECTACCESS|request_id
+#define MSG_REJECT_ACCESS "REJECTACCESS"
+
 // ============================================================================
 // MESSAGE TYPES - COORDINATED COMMANDS (C-NS-SS)
 // ============================================================================
@@ -214,6 +224,10 @@
 // View -l responses
 #define RESP_OK_VIEW_L "OK_VIEW_L"
 #define RESP_OK_VIEW_END "OK_VIEW_END"
+
+// Access request responses
+#define RESP_OK_REQUEST_LIST "OK_REQUEST_LIST"
+#define RESP_OK_REQUEST_LIST_END "OK_REQUEST_LIST_END"
 
 // Checkpoint list responses
 #define RESP_OK_LIST_CHECKPOINT "OK_LIST_CHECKPOINT"

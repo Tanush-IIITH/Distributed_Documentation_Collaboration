@@ -23,6 +23,8 @@ int ns_init(NameServer *ns, int port) {
     ns->ss_count = 0;
     ns->client_count = 0;
     ns->file_count = 0;
+    ns->request_count = 0;
+    ns->next_request_id = 1;
     memset(ns->file_index, 0, sizeof(ns->file_index));
     memset(ns->file_cache, 0, sizeof(ns->file_cache));
     ns->cache_tick = 0;
@@ -1320,6 +1322,200 @@ static void run_client_loop(ConnectionContext *ctx) {
                     if (target_ss_acquired && target_ss) {
                         storage_server_release(target_ss);
                     }
+                }
+            }
+        } else if (strcmp(command, MSG_REQUEST_ACCESS) == 0) {
+            if (cmd_msg.field_count < 3) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Usage: REQUESTACCESS <filename> <R|W>", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+                const char *perm = cmd_msg.fields[2];
+                int grant_read = 0;
+                int grant_write = 0;
+
+                if (!validate_filename(filename)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename.", ctx->peer_ip, ctx->peer_port);
+                    
+                } else if (parse_permission_flags(perm, &grant_read, &grant_write) != 0 || (!grant_read && !grant_write)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Permission must be R or W.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    pthread_mutex_lock(&ns->state_lock);
+                    FileIndexNode *node = file_index_find(ns, filename);
+                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found.", ctx->peer_ip, ctx->peer_port);
+                    } else if (ns->request_count >= NS_MAX_ACCESS_REQUESTS) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Request queue is full.", ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        FileMetadata *file = &ns->files[node->file_array_index];
+                        AccessRequest *req = &ns->access_requests[ns->request_count++];
+                        req->id = ns->next_request_id++;
+                        safe_strcpy(req->filename, filename, sizeof(req->filename));
+                        safe_strcpy(req->from_user, ctx->username, sizeof(req->from_user));
+                        safe_strcpy(req->to_user, file->owner, sizeof(req->to_user));
+                        req->grant_read = grant_read;
+                        req->grant_write = grant_write;
+                        req->is_pending = 1;
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_simple_ok(ctx->conn_fd, "Access request submitted.");
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_LIST_REQUESTS) == 0) {
+            pthread_mutex_lock(&ns->state_lock);
+            for (int i = 0; i < ns->request_count; i++) {
+                AccessRequest *req = &ns->access_requests[i];
+                if (!req->is_pending || strcmp(req->to_user, ctx->username) != 0) {
+                    continue;
+                }
+
+                char id_buf[16];
+                snprintf(id_buf, sizeof(id_buf), "%d", req->id);
+
+                const char *perm;
+                if (req->grant_write && req->grant_read) {
+                    perm = "Read & Write";
+                } else if (req->grant_write) {
+                    perm = "Write";
+                } else {
+                    perm = "Read";
+                }
+                const char *fields[] = {RESP_OK_REQUEST_LIST, id_buf, req->filename, req->from_user, perm};
+                char *resp = protocol_build_message(fields, 5);
+                if (resp) {
+                    protocol_send_message(ctx->conn_fd, resp);
+                    free(resp);
+                }
+            }
+            pthread_mutex_unlock(&ns->state_lock);
+
+            const char *end_fields[] = {RESP_OK_REQUEST_LIST_END};
+            char *end_msg = protocol_build_message(end_fields, 1);
+            if (end_msg) {
+                protocol_send_message(ctx->conn_fd, end_msg);
+                free(end_msg);
+            }
+        } else if (strcmp(command, MSG_APPROVE_ACCESS) == 0) {
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Usage: APPROVEACCESS <request_id>", ctx->peer_ip, ctx->peer_port);
+            } else {
+                int req_id = atoi(cmd_msg.fields[1]);
+                AccessRequest *target_req = NULL;
+                int file_index = -1;
+                StorageServerInfo *target_ss = NULL;
+                int target_ss_acquired = 0;
+                char *ss_resp_raw = NULL;
+                int rollback_needed = 0;
+
+                pthread_mutex_lock(&ns->state_lock);
+                for (int i = 0; i < ns->request_count; i++) {
+                    if (ns->access_requests[i].id == req_id) {
+                        target_req = &ns->access_requests[i];
+                        break;
+                    }
+                }
+
+                if (!target_req || !target_req->is_pending || strcmp(target_req->to_user, ctx->username) != 0) {
+                    pthread_mutex_unlock(&ns->state_lock);
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid request ID or not file owner.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    FileIndexNode *node = file_index_find(ns, target_req->filename);
+                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File for this request no longer exists.", ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        file_index = node->file_array_index;
+                        FileMetadata *file = &ns->files[file_index];
+                        file_add_access(file, target_req->from_user, target_req->grant_read, target_req->grant_write);
+                        target_req->is_pending = 0;
+
+                        for (int i = 0; i < ns->ss_count; i++) {
+                            StorageServerInfo *candidate = ns->storage_servers[i];
+                            if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
+                                continue;
+                            }
+                            if (strcmp(candidate->client_ip, file->ss_ip) == 0 && candidate->client_port == file->ss_port) {
+                                target_ss = candidate;
+                                storage_server_acquire(target_ss);
+                                target_ss_acquired = 1;
+                                break;
+                            }
+                        }
+
+                        pthread_mutex_unlock(&ns->state_lock);
+
+                        if (!target_ss) {
+                            rollback_needed = 1;
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server is offline. Access not granted.", ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            char perm_token[3] = "";
+                            if (target_req->grant_read) {
+                                safe_strcat(perm_token, "R", sizeof(perm_token));
+                            }
+                            if (target_req->grant_write) {
+                                safe_strcat(perm_token, "W", sizeof(perm_token));
+                            }
+                            const char *ss_fields[] = {MSG_SS_ADDACCESS, target_req->filename, target_req->from_user, perm_token[0] ? perm_token : "R"};
+                            int ss_status = storage_server_send_and_wait(target_ss, ss_fields, 4, &ss_resp_raw);
+
+                            if (ss_status != 0) {
+                                rollback_needed = 1;
+                                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server failed to update ACL.", ctx->peer_ip, ctx->peer_port);
+                            } else if (ss_resp_raw) {
+                                ProtocolMessage ss_msg;
+                                if (protocol_parse_message(ss_resp_raw, &ss_msg) != 0 || protocol_is_error(&ss_msg)) {
+                                    rollback_needed = 1;
+                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server rejected ACL change.", ctx->peer_ip, ctx->peer_port);
+                                    protocol_free_message(&ss_msg);
+                                } else {
+                                    protocol_free_message(&ss_msg);
+                                    send_simple_ok(ctx->conn_fd, "Access approved and saved.");
+                                }
+                                free(ss_resp_raw);
+                                ss_resp_raw = NULL;
+                            } else {
+                                send_simple_ok(ctx->conn_fd, "Access approved and saved.");
+                            }
+                        }
+
+                        if (rollback_needed) {
+                            pthread_mutex_lock(&ns->state_lock);
+                            if (file_index >= 0 && file_index < ns->file_count) {
+                                file_remove_access(&ns->files[file_index], target_req->from_user);
+                            }
+                            target_req->is_pending = 1;
+                            pthread_mutex_unlock(&ns->state_lock);
+                        }
+
+                        if (target_ss_acquired) {
+                            storage_server_release(target_ss);
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_REJECT_ACCESS) == 0) {
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Usage: REJECTACCESS <request_id>", ctx->peer_ip, ctx->peer_port);
+            } else {
+                int req_id = atoi(cmd_msg.fields[1]);
+                int found = 0;
+
+                pthread_mutex_lock(&ns->state_lock);
+                for (int i = 0; i < ns->request_count; i++) {
+                    AccessRequest *req = &ns->access_requests[i];
+                    if (req->id == req_id && req->is_pending && strcmp(req->to_user, ctx->username) == 0) {
+                        req->is_pending = 0;
+                        found = 1;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&ns->state_lock);
+
+                if (found) {
+                    send_simple_ok(ctx->conn_fd, "Request rejected.");
+                } else {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid or non-pending request ID.", ctx->peer_ip, ctx->peer_port);
                 }
             }
         } else if (strcmp(command, MSG_CREATE) == 0) {
