@@ -7,6 +7,7 @@
 
 // Storage Server configuration
 #define SS_MAX_FILES 10000
+// Base directory under which each storage server instance gets its own subfolder.
 #define SS_STORAGE_PATH "./ss_storage/"
 #define SS_META_SUFFIX ".meta"
 #define SS_UNDO_SUFFIX ".undo"

@@ -80,6 +80,40 @@ static int build_path(char *buffer, size_t size, const char *base, const char *f
     return 0;
 }
 
+static int ss_build_storage_path(char *buffer, size_t size, const char *client_ip, int client_port) {
+    if (!buffer || size == 0) {
+        return -1;
+    }
+
+    const char *ip_source = (client_ip && client_ip[0]) ? client_ip : "local";
+    char sanitized_ip[MAX_IP_LENGTH];
+    if (safe_strcpy(sanitized_ip, ip_source, sizeof(sanitized_ip)) != 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; sanitized_ip[i] != '\0'; i++) {
+        unsigned char ch = (unsigned char)sanitized_ip[i];
+        if (!(isalnum(ch) || ch == '_')) {
+            sanitized_ip[i] = '_';
+        }
+    }
+
+    if (sanitized_ip[0] == '\0') {
+        safe_strcpy(sanitized_ip, "local", sizeof(sanitized_ip));
+    }
+
+    if (client_port < 0) {
+        client_port = 0;
+    }
+
+    int written = snprintf(buffer, size, "%sserver_%s_%d/", SS_STORAGE_PATH, sanitized_ip, client_port);
+    if (written < 0 || (size_t)written >= size) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static int dirent_is_directory(const char *base_path, const struct dirent *entry) {
     if (!base_path || !entry) {
         return 0;
@@ -2363,8 +2397,11 @@ int ss_init(StorageServer *ss, const char *ns_ip, int ns_port,
     strncpy(ss->client_ip, client_ip, MAX_IP_LENGTH - 1);
     ss->client_port = client_port;
     
-    // Set storage path
-    strncpy(ss->storage_path, SS_STORAGE_PATH, MAX_PATH_LENGTH - 1);
+    // Set storage path (unique per storage server instance)
+    if (ss_build_storage_path(ss->storage_path, sizeof(ss->storage_path), ss->client_ip, ss->client_port) != 0) {
+        log_message(LOG_ERROR, "SS", "Failed to derive storage path for %s:%d", ss->client_ip, ss->client_port);
+        return -1;
+    }
     
     // Create storage directory
     if (create_directory_recursive(ss->storage_path) != 0) {
