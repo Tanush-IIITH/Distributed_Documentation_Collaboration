@@ -723,16 +723,22 @@ static void *ns_control_loop(void *arg) {
                 const char *filename = msg.fields[1];
                 if (!validate_filename(filename)) {
                     ss_send_ns_error(ss, ERR_INVALID_REQUEST, "Invalid filename");
-                } else if (ss_delete_file(ss, filename) != 0) {
-                    ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "File not found");
                 } else {
-                    const char *fields[] = {RESP_OK_DELETE, filename};
-                    char *resp = protocol_build_message(fields, 2);
-                    if (resp) {
-                        protocol_send_message(ss->ns_sockfd, resp);
-                        free(resp);
+                    int delete_status = ss_delete_file(ss, filename);
+
+                    if (delete_status == -1) {
+                        ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "File not found");
+                    } else if (delete_status == -2) {
+                        ss_send_ns_error(ss, ERR_SENTENCE_LOCKED, "File is locked for writing");
+                    } else {
+                        const char *fields[] = {RESP_OK_DELETE, filename};
+                        char *resp = protocol_build_message(fields, 2);
+                        if (resp) {
+                            protocol_send_message(ss->ns_sockfd, resp);
+                            free(resp);
+                        }
+                        log_message(LOG_INFO, "SS", "Deleted file %s", filename);
                     }
-                    log_message(LOG_INFO, "SS", "Deleted file %s", filename);
                 }
             }
         } else if (strcmp(command, MSG_GET_STATS) == 0) {
@@ -1251,9 +1257,24 @@ static int ss_delete_file(StorageServer *ss, const char *filename) {
         return -1;
     }
 
+    pthread_mutex_lock(&ss->sessions_lock);
+    int writers_active = ss_file_has_active_writers(ss, node);
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    if (writers_active) {
+        pthread_mutex_unlock(&ss->files_lock);
+        return -2;
+    }
+
     unlink(node->filepath);
     unlink(node->metapath);
     unlink(node->undopath);
+
+    for (int i = 0; i < node->checkpoint_count; i++) {
+        if (node->checkpoints[i].filepath[0]) {
+            unlink(node->checkpoints[i].filepath);
+        }
+    }
 
     if (prev) {
         prev->next = node->next;
