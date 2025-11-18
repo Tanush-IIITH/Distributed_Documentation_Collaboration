@@ -17,6 +17,7 @@
 
 static FILE *log_file_ptr = NULL;
 static LogLevel current_log_level = LOG_INFO;
+static int console_logging_enabled = 1;
 
 // ============================================================================
 // LOGGING UTILITIES
@@ -36,6 +37,10 @@ int log_init(const char *log_file, LogLevel level) {
     return 0;
 }
 
+void log_set_console(int enable) {
+    console_logging_enabled = enable ? 1 : 0;
+}
+
 void log_message(LogLevel level, const char *component, const char *format, ...) {
     if (level < current_log_level) {
         return;
@@ -50,8 +55,10 @@ void log_message(LogLevel level, const char *component, const char *format, ...)
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
 
-    fprintf(stdout, "[%s] [%s] [%s] %s\n", timestamp, level_str[level], component, buffer);
-    fflush(stdout);
+    if (console_logging_enabled) {
+        fprintf(stdout, "[%s] [%s] [%s] %s\n", timestamp, level_str[level], component, buffer);
+        fflush(stdout);
+    }
 
     if (log_file_ptr) {
         fprintf(log_file_ptr, "[%s] [%s] [%s] %s\n", timestamp, level_str[level], component, buffer);
@@ -70,8 +77,10 @@ void log_request(const char *component, const char *source_ip, int source_port,
              timestamp, component, source_ip, source_port, dest_ip, dest_port,
              username ? username : "N/A", request);
 
-    fprintf(stdout, "%s\n", buffer);
-    fflush(stdout);
+    if (console_logging_enabled) {
+        fprintf(stdout, "%s\n", buffer);
+        fflush(stdout);
+    }
 
     if (log_file_ptr) {
         fprintf(log_file_ptr, "%s\n", buffer);

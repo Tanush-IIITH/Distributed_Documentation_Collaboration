@@ -2058,6 +2058,7 @@ int main(int argc, char *argv[]) {
     
     // Initialize logging
     log_init("client.log", LOG_INFO);
+    log_set_console(0);
     
     // Create client
     Client client;

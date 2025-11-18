@@ -33,6 +33,12 @@ typedef enum {
 int log_init(const char *log_file, LogLevel level);
 
 /**
+ * Enable or disable console logging (stdout/stderr).
+ * enable = 1 to mirror logs to console (default), 0 to disable.
+ */
+void log_set_console(int enable);
+
+/**
  * Log a message with timestamp and metadata
  */
 void log_message(LogLevel level, const char *component, const char *format, ...);

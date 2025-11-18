@@ -2593,6 +2593,7 @@ int main(int argc, char *argv[]) {
     
     // Initialize logging
     log_init("storage_server.log", LOG_INFO);
+    log_set_console(0);
     
     // Create storage server
     StorageServer ss;
