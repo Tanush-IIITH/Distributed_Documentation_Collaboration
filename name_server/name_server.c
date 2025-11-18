@@ -11,6 +11,11 @@
 #include <limits.h>
 #include <strings.h>
 
+#define NS_DB_PATH "ns_metadata.db"
+
+static void ns_save_metadata(NameServer *ns);
+static void ns_load_metadata(NameServer *ns);
+
 // Initialize the Name Server
 int ns_init(NameServer *ns, int port) {
     if (!ns) {
@@ -34,6 +39,7 @@ int ns_init(NameServer *ns, int port) {
         return -1;
     }
     
+    ns_load_metadata(ns);
     log_message(LOG_INFO, "NS", "Name Server initialized on port %d", port);
     return 0;
 }
@@ -441,6 +447,22 @@ static void file_cache_store(NameServer *ns, const char *filename, int array_ind
     target->valid = 1;
 }
 
+static void ns_clear_file_index(NameServer *ns) {
+    if (!ns) {
+        return;
+    }
+
+    for (int i = 0; i < FILE_INDEX_SIZE; i++) {
+        FileIndexNode *node = ns->file_index[i];
+        while (node) {
+            FileIndexNode *next = node->next;
+            free(node);
+            node = next;
+        }
+        ns->file_index[i] = NULL;
+    }
+}
+
 static int remove_file_metadata_locked(NameServer *ns, const char *filename) {
     if (!ns || !filename) {
         return 0;
@@ -599,6 +621,134 @@ static void file_acl_parse_csv(char entries[][MAX_USERNAME_LENGTH], int *count, 
         }
         token = strtok(NULL, ",");
     }
+}
+
+static void ns_save_metadata(NameServer *ns) {
+    if (!ns) {
+        return;
+    }
+
+    pthread_mutex_lock(&ns->state_lock);
+    FILE *fp = fopen(NS_DB_PATH, "w");
+    if (!fp) {
+        pthread_mutex_unlock(&ns->state_lock);
+        return;
+    }
+
+    fprintf(fp, "%d\n", ns->file_count);
+    for (int i = 0; i < ns->file_count; i++) {
+        FileMetadata *f = &ns->files[i];
+        fprintf(fp, "FILE|%s|%s|%s|%d|%lld|%lld|%lld|%lld\n",
+                f->filename,
+                f->owner,
+                f->ss_ip,
+                f->ss_port,
+                f->size,
+                (long long)f->created,
+                (long long)f->modified,
+                (long long)f->last_access);
+
+        fprintf(fp, "READ|");
+        for (int j = 0; j < f->read_access_count; j++) {
+            fprintf(fp, "%s%s", f->read_access_users[j], (j + 1 < f->read_access_count) ? "," : "");
+        }
+        fprintf(fp, "\n");
+
+        fprintf(fp, "WRITE|");
+        for (int j = 0; j < f->write_access_count; j++) {
+            fprintf(fp, "%s%s", f->write_access_users[j], (j + 1 < f->write_access_count) ? "," : "");
+        }
+        fprintf(fp, "\n");
+    }
+
+    fclose(fp);
+    pthread_mutex_unlock(&ns->state_lock);
+}
+
+static void ns_load_metadata(NameServer *ns) {
+    if (!ns) {
+        return;
+    }
+
+    pthread_mutex_lock(&ns->state_lock);
+    FILE *fp = fopen(NS_DB_PATH, "r");
+    if (!fp) {
+        pthread_mutex_unlock(&ns->state_lock);
+        return;
+    }
+
+    ns_clear_file_index(ns);
+    memset(ns->files, 0, sizeof(ns->files));
+    memset(ns->file_cache, 0, sizeof(ns->file_cache));
+    ns->cache_tick = 0;
+    ns->file_count = 0;
+
+    char line[MAX_FIELD_SIZE * 2];
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        pthread_mutex_unlock(&ns->state_lock);
+        return;
+    }
+
+    FileMetadata *current = NULL;
+    while (fgets(line, sizeof(line), fp) && ns->file_count < NS_MAX_FILES) {
+        trim_string(line);
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (strncmp(line, "FILE|", 5) == 0) {
+            char *payload = line + 5;
+            char *saveptr = NULL;
+            char *parts[8] = {0};
+            for (int idx = 0; idx < 8; idx++) {
+                parts[idx] = (idx == 0) ? strtok_r(payload, "|", &saveptr)
+                                        : strtok_r(NULL, "|", &saveptr);
+            }
+
+            if (!parts[0] || !validate_filename(parts[0])) {
+                current = NULL;
+                continue;
+            }
+
+            FileMetadata *file = &ns->files[ns->file_count];
+            memset(file, 0, sizeof(FileMetadata));
+            safe_strcpy(file->filename, parts[0], sizeof(file->filename));
+            if (parts[1]) {
+                safe_strcpy(file->owner, parts[1], sizeof(file->owner));
+            }
+            if (parts[2]) {
+                safe_strcpy(file->ss_ip, parts[2], sizeof(file->ss_ip));
+            }
+            if (parts[3]) {
+                file->ss_port = atoi(parts[3]);
+            }
+            if (parts[4]) {
+                file->size = atoll(parts[4]);
+            }
+            if (parts[5]) {
+                file->created = (time_t)atoll(parts[5]);
+            }
+            if (parts[6]) {
+                file->modified = (time_t)atoll(parts[6]);
+            }
+            if (parts[7]) {
+                file->last_access = (time_t)atoll(parts[7]);
+            }
+
+            file_index_insert(ns, file->filename, ns->file_count);
+            current = file;
+            ns->file_count++;
+        } else if (current && strncmp(line, "READ|", 5) == 0) {
+            file_acl_parse_csv(current->read_access_users, &current->read_access_count, line + 5);
+        } else if (current && strncmp(line, "WRITE|", 6) == 0) {
+            file_acl_parse_csv(current->write_access_users, &current->write_access_count, line + 6);
+        }
+    }
+
+    fclose(fp);
+    pthread_mutex_unlock(&ns->state_lock);
+    log_message(LOG_INFO, "NS", "Loaded %d files from metadata store", ns->file_count);
 }
 
 static int file_add_access(FileMetadata *file, const char *username, int grant_read, int grant_write) {
@@ -859,160 +1009,38 @@ static void run_client_loop(ConnectionContext *ctx) {
                 } else if (ctx->username[0] == '\0') {
                     send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
                 } else {
-                    StorageServerInfo *target_ss = NULL;
-                    int target_ss_acquired = 0;
-                    int state_locked = 0;
                     int error_sent = 0;
-                    char resolved_filename[MAX_FILENAME_LENGTH];
-                    char owner[MAX_USERNAME_LENGTH];
-                    char ss_ip[MAX_IP_LENGTH];
-                    int ss_port = 0;
-                    int read_count = 0;
-                    int write_count = 0;
-                    char read_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
-                    char write_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
-                    memset(resolved_filename, 0, sizeof(resolved_filename));
-                    memset(owner, 0, sizeof(owner));
-                    memset(ss_ip, 0, sizeof(ss_ip));
-                    memset(read_users, 0, sizeof(read_users));
-                    memset(write_users, 0, sizeof(write_users));
+                    int metadata_updated = 0;
+                    FileMetadata file_snapshot;
+                    memset(&file_snapshot, 0, sizeof(file_snapshot));
 
                     pthread_mutex_lock(&ns->state_lock);
-                    state_locked = 1;
-
-                    do {
-                        FileIndexNode *node = file_index_find(ns, filename);
-                        if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
-                            send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for INFO.", ctx->peer_ip, ctx->peer_port);
-                            error_sent = 1;
-                            break;
-                        }
-
+                    FileIndexNode *node = file_index_find(ns, filename);
+                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for INFO.", ctx->peer_ip, ctx->peer_port);
+                        error_sent = 1;
+                    } else {
                         FileMetadata *file = &ns->files[node->file_array_index];
                         if (!file_has_read_access(file, ctx->username)) {
                             send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "User lacks read access for INFO.", ctx->peer_ip, ctx->peer_port);
                             error_sent = 1;
-                            break;
+                        } else {
+                            file_snapshot = *file;
+                            file->last_access = get_current_time();
+                            file_snapshot.last_access = file->last_access;
+                            metadata_updated = 1;
                         }
-
-                        safe_strcpy(resolved_filename, file->filename, sizeof(resolved_filename));
-                        safe_strcpy(owner, file->owner, sizeof(owner));
-                        safe_strcpy(ss_ip, file->ss_ip, sizeof(ss_ip));
-                        ss_port = file->ss_port;
-
-                        read_count = file->read_access_count;
-                        if (read_count < 0) {
-                            read_count = 0;
-                        } else if (read_count > NS_MAX_CLIENTS) {
-                            read_count = NS_MAX_CLIENTS;
-                        }
-                        for (int i = 0; i < read_count; i++) {
-                            safe_strcpy(read_users[i], file->read_access_users[i], sizeof(read_users[i]));
-                        }
-
-                        write_count = file->write_access_count;
-                        if (write_count < 0) {
-                            write_count = 0;
-                        } else if (write_count > NS_MAX_CLIENTS) {
-                            write_count = NS_MAX_CLIENTS;
-                        }
-                        for (int i = 0; i < write_count; i++) {
-                            safe_strcpy(write_users[i], file->write_access_users[i], sizeof(write_users[i]));
-                        }
-
-                        for (int i = 0; i < ns->ss_count; i++) {
-                            StorageServerInfo *candidate = ns->storage_servers[i];
-                            if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
-                                continue;
-                            }
-                            if (strncmp(candidate->client_ip, ss_ip, MAX_IP_LENGTH) == 0 && candidate->client_port == ss_port) {
-                                target_ss = candidate;
-                                break;
-                            }
-                        }
-
-                        if (!target_ss) {
-                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server unavailable for INFO.", ctx->peer_ip, ctx->peer_port);
-                            error_sent = 1;
-                            break;
-                        }
-
-                        storage_server_acquire(target_ss);
-                        target_ss_acquired = 1;
-                    } while (0);
-
-                    if (state_locked) {
-                        pthread_mutex_unlock(&ns->state_lock);
-                        state_locked = 0;
                     }
+                    pthread_mutex_unlock(&ns->state_lock);
 
                     if (error_sent) {
-                        if (target_ss_acquired) {
-                            storage_server_release(target_ss);
-                        }
                         continue;
                     }
 
-                    char *ss_resp_raw = NULL;
-                    int ss_status = 0;
-                    const char *ss_fields[] = {MSG_GET_STATS, resolved_filename};
-                    ss_status = storage_server_send_and_wait(target_ss, ss_fields, 2, &ss_resp_raw);
-
-                    storage_server_release(target_ss);
-                    target_ss_acquired = 0;
-
-                    ProtocolMessage ss_resp_msg;
-
-                    if (ss_status != 0) {
-                        const char *detail = "Storage server communication failure.";
-                        if (ss_status == -2) {
-                            detail = "Storage server unavailable.";
-                        } else if (ss_status == -3) {
-                            detail = "Failed to encode storage server command.";
-                        } else if (ss_status == -4) {
-                            detail = "Failed to send command to storage server.";
-                        } else if (ss_status == -5) {
-                            detail = "Storage server disconnected.";
-                        } else if (ss_status == -6) {
-                            detail = "Incomplete response from storage server.";
-                        }
-                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, detail, ctx->peer_ip, ctx->peer_port);
-                        if (ss_resp_raw) {
-                            free(ss_resp_raw);
-                        }
-                        continue;
-                    }
-
-                    if (protocol_parse_message(ss_resp_raw, &ss_resp_msg) != 0 || ss_resp_msg.field_count == 0) {
-                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to parse storage server response.", ctx->peer_ip, ctx->peer_port);
-                        if (ss_resp_raw) {
-                            free(ss_resp_raw);
-                        }
-                        continue;
-                    }
-
-                    if (protocol_is_error(&ss_resp_msg)) {
-                        int err_code = protocol_get_error_code(&ss_resp_msg);
-                        const char *detail = (ss_resp_msg.field_count >= 3) ? ss_resp_msg.fields[2] : "Storage server error.";
-                        send_error_and_log(ctx->conn_fd, err_code, detail, ctx->peer_ip, ctx->peer_port);
-                        protocol_free_message(&ss_resp_msg);
-                        free(ss_resp_raw);
-                        continue;
-                    }
-
-                    if (strcmp(ss_resp_msg.fields[0], RESP_OK_STATS) != 0 || ss_resp_msg.field_count < 10) {
-                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected storage server response for INFO.", ctx->peer_ip, ctx->peer_port);
-                        protocol_free_message(&ss_resp_msg);
-                        free(ss_resp_raw);
-                        continue;
-                    }
-
-                    const char *start_fields[] = {RESP_OK_INFO_START, resolved_filename};
+                    const char *start_fields[] = {RESP_OK_INFO_START, file_snapshot.filename};
                     char *start_msg = protocol_build_message(start_fields, 2);
                     if (!start_msg) {
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build INFO start message.", ctx->peer_ip, ctx->peer_port);
-                        protocol_free_message(&ss_resp_msg);
-                        free(ss_resp_raw);
                         continue;
                     }
 
@@ -1025,34 +1053,35 @@ static void run_client_loop(ConnectionContext *ctx) {
                     if (!send_failed) {
                         char line[MAX_FIELD_SIZE];
 
-                        snprintf(line, sizeof(line), "Owner: %s", (ss_resp_msg.field_count >= 3 && ss_resp_msg.fields[2] && ss_resp_msg.fields[2][0]) ? ss_resp_msg.fields[2] : "N/A");
+                        snprintf(line, sizeof(line), "Owner: %s", file_snapshot.owner[0] ? file_snapshot.owner : "N/A");
                         if (send_info_line(ctx->conn_fd, line) != 0) {
                             send_failed = 1;
                         }
 
                         if (!send_failed) {
-                            snprintf(line, sizeof(line), "Size: %s bytes", (ss_resp_msg.fields[3] && ss_resp_msg.fields[3][0]) ? ss_resp_msg.fields[3] : "0");
+                            long long size_value = file_snapshot.size >= 0 ? file_snapshot.size : 0;
+                            snprintf(line, sizeof(line), "Size: %lld bytes", size_value);
                             if (send_info_line(ctx->conn_fd, line) != 0) {
                                 send_failed = 1;
                             }
                         }
 
                         if (!send_failed) {
-                            snprintf(line, sizeof(line), "Words: %s", (ss_resp_msg.fields[4] && ss_resp_msg.fields[4][0]) ? ss_resp_msg.fields[4] : "0");
+                            snprintf(line, sizeof(line), "Words: %s", "N/A");
                             if (send_info_line(ctx->conn_fd, line) != 0) {
                                 send_failed = 1;
                             }
                         }
 
                         if (!send_failed) {
-                            snprintf(line, sizeof(line), "Chars: %s", (ss_resp_msg.fields[5] && ss_resp_msg.fields[5][0]) ? ss_resp_msg.fields[5] : "0");
+                            snprintf(line, sizeof(line), "Chars: %s", "N/A");
                             if (send_info_line(ctx->conn_fd, line) != 0) {
                                 send_failed = 1;
                             }
                         }
 
                         if (!send_failed) {
-                            long long created_epoch = ss_resp_msg.fields[6] ? atoll(ss_resp_msg.fields[6]) : 0;
+                            long long created_epoch = (long long)file_snapshot.created;
                             char created_buf[64];
                             if (created_epoch > 0) {
                                 const char *tmp = format_time((time_t)created_epoch);
@@ -1067,7 +1096,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                         }
 
                         if (!send_failed) {
-                            long long modified_epoch = ss_resp_msg.fields[7] ? atoll(ss_resp_msg.fields[7]) : 0;
+                            long long modified_epoch = (long long)file_snapshot.modified;
                             char modified_buf[64];
                             if (modified_epoch > 0) {
                                 const char *tmp = format_time((time_t)modified_epoch);
@@ -1082,7 +1111,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                         }
 
                         if (!send_failed) {
-                            long long access_epoch = ss_resp_msg.fields[8] ? atoll(ss_resp_msg.fields[8]) : 0;
+                            long long access_epoch = (long long)file_snapshot.last_access;
                             char access_buf[64];
                             if (access_epoch > 0) {
                                 const char *tmp = format_time((time_t)access_epoch);
@@ -1097,7 +1126,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                         }
 
                         if (!send_failed) {
-                            const char *last_user = (ss_resp_msg.fields[9] && ss_resp_msg.fields[9][0]) ? ss_resp_msg.fields[9] : "N/A";
+                            const char *last_user = "N/A";
                             snprintf(line, sizeof(line), "Last Access User: %s", last_user);
                             if (send_info_line(ctx->conn_fd, line) != 0) {
                                 send_failed = 1;
@@ -1113,23 +1142,23 @@ static void run_client_loop(ConnectionContext *ctx) {
                             int read_first = 1;
                             int write_first = 1;
 
-                            if (owner[0]) {
-                                acl_append_token(read_list, sizeof(read_list), owner, &read_first);
-                                acl_append_token(write_list, sizeof(write_list), owner, &write_first);
+                            if (file_snapshot.owner[0]) {
+                                acl_append_token(read_list, sizeof(read_list), file_snapshot.owner, &read_first);
+                                acl_append_token(write_list, sizeof(write_list), file_snapshot.owner, &write_first);
                             }
 
-                            for (int i = 0; i < read_count; i++) {
-                                if (strncmp(read_users[i], owner, MAX_USERNAME_LENGTH) == 0) {
+                            for (int i = 0; i < file_snapshot.read_access_count; i++) {
+                                if (strncmp(file_snapshot.read_access_users[i], file_snapshot.owner, MAX_USERNAME_LENGTH) == 0) {
                                     continue;
                                 }
-                                acl_append_token(read_list, sizeof(read_list), read_users[i], &read_first);
+                                acl_append_token(read_list, sizeof(read_list), file_snapshot.read_access_users[i], &read_first);
                             }
 
-                            for (int i = 0; i < write_count; i++) {
-                                if (strncmp(write_users[i], owner, MAX_USERNAME_LENGTH) == 0) {
+                            for (int i = 0; i < file_snapshot.write_access_count; i++) {
+                                if (strncmp(file_snapshot.write_access_users[i], file_snapshot.owner, MAX_USERNAME_LENGTH) == 0) {
                                     continue;
                                 }
-                                acl_append_token(write_list, sizeof(write_list), write_users[i], &write_first);
+                                acl_append_token(write_list, sizeof(write_list), file_snapshot.write_access_users[i], &write_first);
                             }
 
                             if (read_first) {
@@ -1158,11 +1187,12 @@ static void run_client_loop(ConnectionContext *ctx) {
                     if (send_failed) {
                         log_message(LOG_WARNING, "NS", "Failed to stream INFO response to %s:%d", ctx->peer_ip, ctx->peer_port);
                     } else {
-                        log_message(LOG_INFO, "NS", "Served INFO for '%s' to %s", resolved_filename, ctx->username);
+                        log_message(LOG_INFO, "NS", "Served INFO for '%s' to %s", file_snapshot.filename, ctx->username);
                     }
 
-                    protocol_free_message(&ss_resp_msg);
-                    free(ss_resp_raw);
+                    if (metadata_updated) {
+                        ns_save_metadata(ns);
+                    }
                 }
             }
         } else if (strcmp(command, MSG_EXEC) == 0) {
@@ -1535,6 +1565,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                     send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
                 } else {
                     int result = -1;
+                    int persist_metadata = 0;
                     StorageServerInfo *target_ss = NULL;
                     int target_ss_acquired = 0;
                     pthread_mutex_lock(&ns->state_lock);
@@ -1597,6 +1628,8 @@ static void run_client_loop(ConnectionContext *ctx) {
                             time_t now = get_current_time();
                             file->created = now;
                             file->modified = now;
+                            file->last_access = now;
+                            file->size = 0;
                             file->read_access_count = 0;
                             file->write_access_count = 0;
 
@@ -1669,6 +1702,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                                                     free(resp);
                                                 }
                                                 log_message(LOG_INFO, "NS", "File '%s' created by %s on SS %s:%d.", filename, ctx->username, target_ss->client_ip, target_ss->client_port);
+                                                persist_metadata = 1;
                                             } else {
                                                 // Handle unexpected responses from storage server
                                                 send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected SS response.", ctx->peer_ip, ctx->peer_port);
@@ -1694,6 +1728,10 @@ static void run_client_loop(ConnectionContext *ctx) {
                                     storage_server_release(target_ss);
                                     target_ss_acquired = 0;
                                 }
+
+                                if (persist_metadata) {
+                                    ns_save_metadata(ns);
+                                }
                             }
                         }
                     }
@@ -1715,6 +1753,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                     char *ss_resp_raw = NULL;
                     ProtocolMessage ss_resp_msg;
                     int ss_resp_parsed = 0;
+                    int persist_metadata = 0;
 
                     pthread_mutex_lock(&ns->state_lock);
                     FileIndexNode *node = file_index_find(ns, filename);
@@ -1783,6 +1822,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                                             snprintf(detail_buf, sizeof(detail_buf), "File '%s' deleted successfully.", filename);
                                             send_simple_ok(ctx->conn_fd, detail_buf);
                                             log_message(LOG_INFO, "NS", "File '%s' deleted by %s via SS %s:%d.", filename, ctx->username, target_ss->client_ip, target_ss->client_port);
+                                            persist_metadata = 1;
                                         }
                                     }
                                 }
@@ -1798,6 +1838,10 @@ static void run_client_loop(ConnectionContext *ctx) {
                                 if (target_ss_acquired) {
                                     storage_server_release(target_ss);
                                     target_ss_acquired = 0;
+                                }
+
+                                if (persist_metadata) {
+                                    ns_save_metadata(ns);
                                 }
                             }
                         }
@@ -1907,6 +1951,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                     int success = 0;
                     int error_sent = 0;
                     int state_locked = 0;
+                    int persist_metadata = 0;
 
                     pthread_mutex_lock(&ns->state_lock);
                     state_locked = 1;
@@ -2054,8 +2099,13 @@ static void run_client_loop(ConnectionContext *ctx) {
                         } else {
                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
                         }
+                        persist_metadata = 1;
                     } else if (!error_sent) {
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
+                    }
+
+                    if (persist_metadata) {
+                        ns_save_metadata(ns);
                     }
                 }
             }
@@ -2082,6 +2132,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                     int state_locked = 0;
                     int had_read = 0;
                     int had_write = 0;
+                    int persist_metadata = 0;
 
                     pthread_mutex_lock(&ns->state_lock);
                     state_locked = 1;
@@ -2222,8 +2273,13 @@ static void run_client_loop(ConnectionContext *ctx) {
                         } else {
                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
                         }
+                        persist_metadata = 1;
                     } else if (!error_sent) {
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
+                    }
+
+                    if (persist_metadata) {
+                        ns_save_metadata(ns);
                     }
                 }
             }

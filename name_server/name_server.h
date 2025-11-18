@@ -17,8 +17,10 @@ typedef struct {
     char owner[MAX_USERNAME_LENGTH];
     char ss_ip[MAX_IP_LENGTH];
     int ss_port;
+    long long size;
     time_t created;
     time_t modified;
+    time_t last_access;
     char read_access_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
     char write_access_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
     int read_access_count;
