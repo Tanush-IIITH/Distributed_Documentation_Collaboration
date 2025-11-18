@@ -903,11 +903,11 @@ static void run_client_loop(ConnectionContext *ctx) {
             // Enumerate every connected user and stream back their usernames to the requester
             pthread_mutex_lock(&ns->state_lock);
             for (int i = 0; i < ns->client_count; i++) {
-                if (!ns->clients[i].is_connected) {
-                    continue;
-                }
+                char display_name[MAX_USERNAME_LENGTH + 32];
+                const char *status = ns->clients[i].is_connected ? "Online" : "Offline";
+                snprintf(display_name, sizeof(display_name), "%s [%s]", ns->clients[i].username, status);
 
-                const char *fields[] = {RESP_OK_LIST, ns->clients[i].username};
+                const char *fields[] = {RESP_OK_LIST, display_name};
                 char *resp = protocol_build_message(fields, 2);
                 if (!resp) {
                     log_message(LOG_WARNING, "NS", "Failed to build LIST_USERS entry for %s.", ns->clients[i].username);
@@ -2666,14 +2666,10 @@ static void *connection_thread(void *arg) {
     if (ctx->is_client && ctx->username[0]) {
         for (int i = 0; i < ns->client_count; i++) {
             ClientInfo *client = &ns->clients[i];
-            if (client->is_connected && strcmp(client->username, ctx->username) == 0) {
-                int last_index = ns->client_count - 1;
-                if (i != last_index) {
-                    ns->clients[i] = ns->clients[last_index];
-                }
-                memset(&ns->clients[last_index], 0, sizeof(ClientInfo));
-                ns->client_count--;
-                log_message(LOG_INFO, "NS", "Client %s deregistered", ctx->username);
+            if (strcmp(client->username, ctx->username) == 0) {
+                client->is_connected = 0;
+                client->sockfd = -1;
+                log_message(LOG_INFO, "NS", "Client %s disconnected (session kept)", ctx->username);
                 break;
             }
         }
@@ -2857,28 +2853,36 @@ int ns_register_client(NameServer *ns, const char *username, int sockfd) {
         return -1;
     }
     
-    if (ns->client_count >= NS_MAX_CLIENTS) {
-        log_message(LOG_ERROR, "NS", "Maximum clients reached");
-        return -1;
-    }
-
+    int existing_index = -1;
     for (int i = 0; i < ns->client_count; i++) {
-        if (ns->clients[i].is_connected && strcmp(ns->clients[i].username, username) == 0) {
-            log_message(LOG_WARNING, "NS", "Client %s already connected", username);
-            return -1;
+        if (strcmp(ns->clients[i].username, username) == 0) {
+            if (ns->clients[i].is_connected) {
+                log_message(LOG_WARNING, "NS", "Client %s already connected", username);
+                return -1;
+            }
+            existing_index = i;
+            break;
         }
     }
 
-    ClientInfo *client = &ns->clients[ns->client_count];
-    memset(client, 0, sizeof(ClientInfo));
-    strncpy(client->username, username, sizeof(client->username) - 1);
-    client->username[sizeof(client->username) - 1] = '\0';
+    ClientInfo *client = NULL;
+    if (existing_index >= 0) {
+        client = &ns->clients[existing_index];
+        log_message(LOG_INFO, "NS", "Reactivating existing client: %s", username);
+    } else {
+        if (ns->client_count >= NS_MAX_CLIENTS) {
+            log_message(LOG_ERROR, "NS", "Maximum clients reached");
+            return -1;
+        }
+        client = &ns->clients[ns->client_count++];
+        memset(client, 0, sizeof(ClientInfo));
+        strncpy(client->username, username, sizeof(client->username) - 1);
+        client->username[sizeof(client->username) - 1] = '\0';
+        log_message(LOG_INFO, "NS", "Registered client: %s", username);
+    }
+
     client->sockfd = sockfd;
     client->is_connected = 1;
-
-    ns->client_count++;
-
-    log_message(LOG_INFO, "NS", "Registered client: %s", username);
     return 0;
 }
 
