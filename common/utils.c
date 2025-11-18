@@ -43,30 +43,40 @@ void log_message(LogLevel level, const char *component, const char *format, ...)
     
     const char *level_str[] = {"DEBUG", "INFO", "WARNING", "ERROR"};
     char *timestamp = get_timestamp();
-    
-    FILE *output = log_file_ptr ? log_file_ptr : stderr;
-    
-    fprintf(output, "[%s] [%s] [%s] ", timestamp, level_str[level], component);
-    
+
+    char buffer[4096];
     va_list args;
     va_start(args, format);
-    vfprintf(output, format, args);
+    vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
-    
-    fprintf(output, "\n");
-    fflush(output);
+
+    fprintf(stdout, "[%s] [%s] [%s] %s\n", timestamp, level_str[level], component, buffer);
+    fflush(stdout);
+
+    if (log_file_ptr) {
+        fprintf(log_file_ptr, "[%s] [%s] [%s] %s\n", timestamp, level_str[level], component, buffer);
+        fflush(log_file_ptr);
+    }
 }
 
 void log_request(const char *component, const char *source_ip, int source_port,
                  const char *dest_ip, int dest_port, const char *username,
                  const char *request) {
     char *timestamp = get_timestamp();
-    FILE *output = log_file_ptr ? log_file_ptr : stderr;
-    
-    fprintf(output, "[%s] [%s] Request: %s:%d -> %s:%d | User: %s | %s\n",
-            timestamp, component, source_ip, source_port, dest_ip, dest_port,
-            username ? username : "N/A", request);
-    fflush(output);
+
+    char buffer[4096];
+    snprintf(buffer, sizeof(buffer),
+             "[%s] [%s] Request: %s:%d -> %s:%d | User: %s | %s",
+             timestamp, component, source_ip, source_port, dest_ip, dest_port,
+             username ? username : "N/A", request);
+
+    fprintf(stdout, "%s\n", buffer);
+    fflush(stdout);
+
+    if (log_file_ptr) {
+        fprintf(log_file_ptr, "%s\n", buffer);
+        fflush(log_file_ptr);
+    }
 }
 
 void log_cleanup(void) {

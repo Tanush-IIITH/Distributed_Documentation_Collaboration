@@ -2099,6 +2099,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                         } else {
                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
                         }
+                        log_message(LOG_INFO, "NS", "%s granted %s %s access on '%s'", ctx->username, target_user, permission, filename);
                         persist_metadata = 1;
                     } else if (!error_sent) {
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
@@ -2273,6 +2274,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                         } else {
                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to send OK response.", ctx->peer_ip, ctx->peer_port);
                         }
+                        log_message(LOG_INFO, "NS", "%s revoked %s access on '%s'", ctx->username, target_user, filename);
                         persist_metadata = 1;
                     } else if (!error_sent) {
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
@@ -2518,6 +2520,8 @@ static void *connection_thread(void *arg) {
 
     NameServer *ns = ctx->ns;
 
+    log_message(LOG_INFO, "NS", "Connection accepted from %s:%d", ctx->peer_ip, ctx->peer_port);
+
     // 1. Read handshake message
     char *raw_message = protocol_receive_message(ctx->conn_fd);
     if (!raw_message) {
@@ -2570,6 +2574,7 @@ static void *connection_thread(void *arg) {
                 ctx->username[0] = '\0';
                 strncpy(ctx->username, msg.fields[1], sizeof(ctx->username) - 1);
                 ctx->username[sizeof(ctx->username) - 1] = '\0';
+                log_message(LOG_INFO, "NS", "Client %s registered from %s:%d", ctx->username, ctx->peer_ip, ctx->peer_port);
             }
         }
     } 
@@ -2606,6 +2611,7 @@ static void *connection_thread(void *arg) {
                 ctx->is_storage_server = 1;
                 ctx->username[0] = '\0';
                 ctx->ss_info = registered_ss;
+                log_message(LOG_INFO, "NS", "Storage server %s:%d registered (client %s:%d)", msg.fields[1], ns_port, msg.fields[3], client_port);
             }
         }
     }
@@ -2677,6 +2683,7 @@ static void *connection_thread(void *arg) {
         free(ss_to_free);
     }
 
+    log_message(LOG_INFO, "NS", "Connection closed for %s:%d", ctx->peer_ip, ctx->peer_port);
     close_connection(ctx);
     return NULL;
 }
