@@ -362,7 +362,7 @@ static StorageServerInfo *find_storage_server_by_sockfd(NameServer *ns, int sock
 
 //LRU file cache lookup
 static int file_cache_lookup(NameServer *ns, const char *filename, FileMetadata *out_metadata, int *out_index) {
-    if (!ns || !filename || !out_metadata) {
+    if (!ns || !filename) {
         return 0;
     }
 
@@ -378,7 +378,9 @@ static int file_cache_lookup(NameServer *ns, const char *filename, FileMetadata 
                 continue;
             }
 
-            *out_metadata = ns->files[entry->file_array_index];
+            if (out_metadata) {
+                *out_metadata = ns->files[entry->file_array_index];
+            }
             if (out_index) {
                 *out_index = entry->file_array_index;
             }
@@ -445,6 +447,36 @@ static void file_cache_store(NameServer *ns, const char *filename, int array_ind
     target->file_array_index = array_index;
     target->last_used = ++ns->cache_tick;
     target->valid = 1;
+}
+
+// Resolve metadata for a filename using the cache first, falling back to the index.
+// Caller must hold ns->state_lock because we access shared arrays directly.
+static FileMetadata *file_lookup_locked(NameServer *ns, const char *filename, int *out_index) {
+    if (!ns || !filename) {
+        return NULL;
+    }
+
+    FileMetadata cached_copy;
+    int cache_index = -1;
+    if (file_cache_lookup(ns, filename, &cached_copy, &cache_index)) {
+        if (cache_index >= 0 && cache_index < ns->file_count) {
+            if (out_index) {
+                *out_index = cache_index;
+            }
+            return &ns->files[cache_index];
+        }
+    }
+
+    FileIndexNode *node = file_index_find(ns, filename);
+    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+        return NULL;
+    }
+
+    if (out_index) {
+        *out_index = node->file_array_index;
+    }
+    file_cache_store(ns, filename, node->file_array_index);
+    return &ns->files[node->file_array_index];
 }
 
 static void ns_clear_file_index(NameServer *ns) {
@@ -1015,12 +1047,12 @@ static void run_client_loop(ConnectionContext *ctx) {
                     memset(&file_snapshot, 0, sizeof(file_snapshot));
 
                     pthread_mutex_lock(&ns->state_lock);
-                    FileIndexNode *node = file_index_find(ns, filename);
-                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                    int file_index = -1;
+                    FileMetadata *file = file_lookup_locked(ns, filename, &file_index);
+                    if (!file) {
                         send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for INFO.", ctx->peer_ip, ctx->peer_port);
                         error_sent = 1;
                     } else {
-                        FileMetadata *file = &ns->files[node->file_array_index];
                         if (!file_has_read_access(file, ctx->username)) {
                             send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "User lacks read access for INFO.", ctx->peer_ip, ctx->peer_port);
                             error_sent = 1;
@@ -1215,14 +1247,15 @@ static void run_client_loop(ConnectionContext *ctx) {
 
                     do {
                         pthread_mutex_lock(&ns->state_lock);
-                        FileIndexNode *node = file_index_find(ns, filename);
-                        if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        int file_index = -1;
+                        FileMetadata *file = file_lookup_locked(ns, filename, &file_index);
+                        if (!file) {
                             pthread_mutex_unlock(&ns->state_lock);
                             send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found.", ctx->peer_ip, ctx->peer_port);
                             break;
                         }
 
-                        FileMetadata file_snapshot = ns->files[node->file_array_index];
+                        FileMetadata file_snapshot = *file;
                         if (!file_has_read_access(&file_snapshot, ctx->username)) {
                             pthread_mutex_unlock(&ns->state_lock);
                             send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "User lacks read access for EXEC.", ctx->peer_ip, ctx->peer_port);
@@ -1370,15 +1403,15 @@ static void run_client_loop(ConnectionContext *ctx) {
                     send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Permission must be R or W.", ctx->peer_ip, ctx->peer_port);
                 } else {
                     pthread_mutex_lock(&ns->state_lock);
-                    FileIndexNode *node = file_index_find(ns, filename);
-                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                    int file_index = -1;
+                    FileMetadata *file = file_lookup_locked(ns, filename, &file_index);
+                    if (!file) {
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found.", ctx->peer_ip, ctx->peer_port);
                     } else if (ns->request_count >= NS_MAX_ACCESS_REQUESTS) {
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Request queue is full.", ctx->peer_ip, ctx->peer_port);
                     } else {
-                        FileMetadata *file = &ns->files[node->file_array_index];
                         AccessRequest *req = &ns->access_requests[ns->request_count++];
                         req->id = ns->next_request_id++;
                         safe_strcpy(req->filename, filename, sizeof(req->filename));
@@ -1450,13 +1483,11 @@ static void run_client_loop(ConnectionContext *ctx) {
                     pthread_mutex_unlock(&ns->state_lock);
                     send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid request ID or not file owner.", ctx->peer_ip, ctx->peer_port);
                 } else {
-                    FileIndexNode *node = file_index_find(ns, target_req->filename);
-                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                    FileMetadata *file = file_lookup_locked(ns, target_req->filename, &file_index);
+                    if (!file) {
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File for this request no longer exists.", ctx->peer_ip, ctx->peer_port);
                     } else {
-                        file_index = node->file_array_index;
-                        FileMetadata *file = &ns->files[file_index];
                         file_add_access(file, target_req->from_user, target_req->grant_read, target_req->grant_write);
                         target_req->is_pending = 0;
 
@@ -1570,11 +1601,13 @@ static void run_client_loop(ConnectionContext *ctx) {
                     int target_ss_acquired = 0;
                     pthread_mutex_lock(&ns->state_lock);
 
+                    int preexisting_index = -1;
+
                     if (ns->file_count >= NS_MAX_FILES) {
                         // Check if the maximum file limit is reached
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Maximum file limit reached.", ctx->peer_ip, ctx->peer_port);
-                    } else if (file_index_find(ns, filename) != NULL) {
+                    } else if (file_lookup_locked(ns, filename, &preexisting_index) != NULL) {
                         // Check if the file already exists
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_FILE_EXISTS, "File already exists.", ctx->peer_ip, ctx->peer_port);
@@ -1756,12 +1789,12 @@ static void run_client_loop(ConnectionContext *ctx) {
                     int persist_metadata = 0;
 
                     pthread_mutex_lock(&ns->state_lock);
-                    FileIndexNode *node = file_index_find(ns, filename);
-                    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                    int file_slot = -1;
+                    FileMetadata *file = file_lookup_locked(ns, filename, &file_slot);
+                    if (!file) {
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for DELETE.", ctx->peer_ip, ctx->peer_port);
                     } else {
-                        FileMetadata *file = &ns->files[node->file_array_index];
                         if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
                             pthread_mutex_unlock(&ns->state_lock);
                             send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may delete the file.", ctx->peer_ip, ctx->peer_port);
@@ -1875,9 +1908,9 @@ static void run_client_loop(ConnectionContext *ctx) {
                 int operation_known = 1;
 
                 pthread_mutex_lock(&ns->state_lock);
-                FileIndexNode *node = file_index_find(ns, filename);
-                if (node && node->file_array_index >= 0 && node->file_array_index < ns->file_count) {
-                    FileMetadata *file = &ns->files[node->file_array_index];
+                int file_index = -1;
+                FileMetadata *file = file_lookup_locked(ns, filename, &file_index);
+                if (file) {
                     file_exists = 1;
 
                     if (!operation || operation[0] == '\0' || strcasecmp(operation, "READ") == 0) {
@@ -1900,7 +1933,9 @@ static void run_client_loop(ConnectionContext *ctx) {
 
                     if (operation_known && have_access) {
                         file_snapshot = *file;
-                        file_cache_store(ns, filename, node->file_array_index);
+                        if (file_index >= 0) {
+                            file_cache_store(ns, filename, file_index);
+                        }
                     }
                 }
                 pthread_mutex_unlock(&ns->state_lock);
@@ -1957,15 +1992,12 @@ static void run_client_loop(ConnectionContext *ctx) {
                     state_locked = 1;
 
                     do {
-                        FileIndexNode *node = file_index_find(ns, filename);
-                        if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        FileMetadata *file = file_lookup_locked(ns, filename, &file_index);
+                        if (!file) {
                             send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for ADDACCESS.", ctx->peer_ip, ctx->peer_port);
                             error_sent = 1;
                             break;
                         }
-
-                        file_index = node->file_array_index;
-                        FileMetadata *file = &ns->files[file_index];
 
                         if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
                             send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may modify access.", ctx->peer_ip, ctx->peer_port);
@@ -2139,15 +2171,12 @@ static void run_client_loop(ConnectionContext *ctx) {
                     state_locked = 1;
 
                     do {
-                        FileIndexNode *node = file_index_find(ns, filename);
-                        if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+                        FileMetadata *file = file_lookup_locked(ns, filename, &file_index);
+                        if (!file) {
                             send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for REMACCESS.", ctx->peer_ip, ctx->peer_port);
                             error_sent = 1;
                             break;
                         }
-
-                        file_index = node->file_array_index;
-                        FileMetadata *file = &ns->files[file_index];
 
                         if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
                             send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may modify access.", ctx->peer_ip, ctx->peer_port);
@@ -2863,17 +2892,15 @@ int ns_find_storage_server(NameServer *ns, const char *filename) {
     // Protect shared metadata structures while resolving the filename → storage server mapping
     pthread_mutex_lock(&ns->state_lock);
 
-    // Step 1: Resolve the filename to its metadata entry using the hash index
-    FileIndexNode *node = file_index_find(ns, filename);
-    if (!node || node->file_array_index < 0 || node->file_array_index >= ns->file_count) {
+    // Step 1: Resolve the filename to its metadata entry using the cache-aware helper
+    int file_index = -1;
+    FileMetadata *file = file_lookup_locked(ns, filename, &file_index);
+    if (!file) {
         pthread_mutex_unlock(&ns->state_lock);
         return -1;
     }
 
-    // Step 2: Access the FileMetadata record to obtain the recorded storage server location
-    FileMetadata *file = &ns->files[node->file_array_index];
-
-    // Step 3: Find the live storage server whose client-facing address matches the file location
+    // Step 2: Find the live storage server whose client-facing address matches the file location
     for (int i = 0; i < ns->ss_count; i++) {
         StorageServerInfo *ss = ns->storage_servers[i];
         if (!ss || !ss->is_alive) {
