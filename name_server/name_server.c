@@ -670,15 +670,17 @@ static void ns_save_metadata(NameServer *ns) {
     fprintf(fp, "%d\n", ns->file_count);
     for (int i = 0; i < ns->file_count; i++) {
         FileMetadata *f = &ns->files[i];
-        fprintf(fp, "FILE|%s|%s|%s|%d|%lld|%lld|%lld|%lld\n",
+        fprintf(fp, "FILE|%s|%s|%s|%d|%lld|%lld|%lld|%lld|%lld|%lld\n",
                 f->filename,
                 f->owner,
                 f->ss_ip,
                 f->ss_port,
                 f->size,
-                (long long)f->created,
-                (long long)f->modified,
-                (long long)f->last_access);
+            f->word_count,
+            f->char_count,
+            (long long)f->created,
+            (long long)f->modified,
+            (long long)f->last_access);
 
         fprintf(fp, "READ|");
         for (int j = 0; j < f->read_access_count; j++) {
@@ -732,10 +734,15 @@ static void ns_load_metadata(NameServer *ns) {
         if (strncmp(line, "FILE|", 5) == 0) {
             char *payload = line + 5;
             char *saveptr = NULL;
-            char *parts[8] = {0};
-            for (int idx = 0; idx < 8; idx++) {
+            char *parts[10] = {0};
+            int token_count = 0;
+            for (int idx = 0; idx < 10; idx++) {
                 parts[idx] = (idx == 0) ? strtok_r(payload, "|", &saveptr)
                                         : strtok_r(NULL, "|", &saveptr);
+                if (!parts[idx]) {
+                    break;
+                }
+                token_count++;
             }
 
             if (!parts[0] || !validate_filename(parts[0])) {
@@ -755,17 +762,39 @@ static void ns_load_metadata(NameServer *ns) {
             if (parts[3]) {
                 file->ss_port = atoi(parts[3]);
             }
+            file->word_count = 0;
+            file->char_count = 0;
             if (parts[4]) {
                 file->size = atoll(parts[4]);
             }
-            if (parts[5]) {
-                file->created = (time_t)atoll(parts[5]);
-            }
-            if (parts[6]) {
-                file->modified = (time_t)atoll(parts[6]);
-            }
-            if (parts[7]) {
-                file->last_access = (time_t)atoll(parts[7]);
+
+            if (token_count >= 10) {
+                if (parts[5]) {
+                    file->word_count = atoll(parts[5]);
+                }
+                if (parts[6]) {
+                    file->char_count = atoll(parts[6]);
+                }
+                if (parts[7]) {
+                    file->created = (time_t)atoll(parts[7]);
+                }
+                if (parts[8]) {
+                    file->modified = (time_t)atoll(parts[8]);
+                }
+                if (parts[9]) {
+                    file->last_access = (time_t)atoll(parts[9]);
+                }
+            } else {
+                // Legacy metadata (without counts) -> set counters to zero
+                if (parts[5]) {
+                    file->created = (time_t)atoll(parts[5]);
+                }
+                if (parts[6]) {
+                    file->modified = (time_t)atoll(parts[6]);
+                }
+                if (parts[7]) {
+                    file->last_access = (time_t)atoll(parts[7]);
+                }
             }
 
             file_index_insert(ns, file->filename, ns->file_count);
@@ -975,14 +1004,13 @@ static void run_client_loop(ConnectionContext *ctx) {
                     }
 
                     if (request_details) {
-                        char word_buf[16];
-                        char char_buf[16];
+                        char word_buf[32];
+                        char char_buf[32];
                         char accessed_buf[64];
                         char modified_buf[64];
 
-                        // TODO: Replace placeholders once the storage server reports real stats.
-                        snprintf(word_buf, sizeof(word_buf), "%s", "N/A");
-                        snprintf(char_buf, sizeof(char_buf), "%s", "N/A");
+                        snprintf(word_buf, sizeof(word_buf), "%lld", file->word_count);
+                        snprintf(char_buf, sizeof(char_buf), "%lld", file->char_count);
 
                         const char *last_access = (file->created > 0) ? format_time(file->created) : "N/A";
                         const char *last_modified = (file->modified > 0) ? format_time(file->modified) : "N/A";
@@ -2348,7 +2376,7 @@ static void run_ss_loop(ConnectionContext *ctx) {
         }
 
         if (strcmp(file_msg.fields[0], MSG_SS_HAS_FILE) == 0) {
-            if (file_msg.field_count < 3) {
+            if (file_msg.field_count < 5) {
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Incomplete SS_HAS_FILE message.", ctx->peer_ip, ctx->peer_port);
                 protocol_free_message(&file_msg);
                 free(file_msg_raw);
@@ -2359,6 +2387,9 @@ static void run_ss_loop(ConnectionContext *ctx) {
             const char *owner = (file_msg.field_count >= 3 && file_msg.fields[2]) ? file_msg.fields[2] : "";
             const char *read_acl_csv = (file_msg.field_count >= 4 && file_msg.fields[3]) ? file_msg.fields[3] : "";
             const char *write_acl_csv = (file_msg.field_count >= 5 && file_msg.fields[4]) ? file_msg.fields[4] : "";
+            long long size = (file_msg.field_count >= 6 && file_msg.fields[5]) ? atoll(file_msg.fields[5]) : 0;
+            long long words = (file_msg.field_count >= 7 && file_msg.fields[6]) ? atoll(file_msg.fields[6]) : 0;
+            long long chars = (file_msg.field_count >= 8 && file_msg.fields[7]) ? atoll(file_msg.fields[7]) : 0;
             if (!validate_filename(filename)) {
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename received from storage server.", ctx->peer_ip, ctx->peer_port);
                 protocol_free_message(&file_msg);
@@ -2406,6 +2437,9 @@ static void run_ss_loop(ConnectionContext *ctx) {
                 safe_strcpy(file->ss_ip, ss_entry->client_ip, sizeof(file->ss_ip));
                 file->ss_port = ss_entry->client_port;
                 file->modified = now;
+                file->size = size;
+                file->word_count = words;
+                file->char_count = chars;
                 file_acl_parse_csv(file->read_access_users, &file->read_access_count, read_acl_csv);
                 file_acl_parse_csv(file->write_access_users, &file->write_access_count, write_acl_csv);
                 log_message(LOG_INFO, "NS", "Updated file '%s' location to %s:%d", filename, ss_entry->client_ip, ss_entry->client_port);
@@ -2444,6 +2478,9 @@ static void run_ss_loop(ConnectionContext *ctx) {
                 file->ss_port = ss_entry->client_port;
                 file->created = now;
                 file->modified = now;
+                file->size = size;
+                file->word_count = words;
+                file->char_count = chars;
                 file_acl_parse_csv(file->read_access_users, &file->read_access_count, read_acl_csv);
                 file_acl_parse_csv(file->write_access_users, &file->write_access_count, write_acl_csv);
 
@@ -2526,8 +2563,40 @@ static void run_ss_loop(ConnectionContext *ctx) {
         const char *command = cmd_msg.fields[0];
         log_request("NS", ctx->peer_ip, ctx->peer_port, "0.0.0.0", ns->port, NULL, command);
 
-        // TODO: Handle storage server commands (e.g., heartbeats, write notifications)
-        log_message(LOG_WARNING, "NS", "Unhandled SS command '%s' from %s:%d", command, ctx->peer_ip, ctx->peer_port);
+        if (strcmp(command, MSG_WRITE_COMPLETE) == 0) {
+            if (cmd_msg.field_count < 5) {
+                log_message(LOG_WARNING, "NS", "WRITE_COMPLETE missing fields from %s:%d", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *filename = cmd_msg.fields[1];
+                long long size = atoll(cmd_msg.fields[2]);
+                long long words = atoll(cmd_msg.fields[3]);
+                long long chars = atoll(cmd_msg.fields[4]);
+
+                int updated = 0;
+                pthread_mutex_lock(&ns->state_lock);
+                FileIndexNode *node = file_index_find(ns, filename);
+                if (node && node->file_array_index >= 0 && node->file_array_index < ns->file_count) {
+                    FileMetadata *file = &ns->files[node->file_array_index];
+                    file->size = size;
+                    file->word_count = words;
+                    file->char_count = chars;
+                    file->modified = get_current_time();
+                    file_cache_store(ns, filename, node->file_array_index);
+                    updated = 1;
+                } else {
+                    log_message(LOG_WARNING, "NS", "WRITE_COMPLETE for unknown file '%s'", filename);
+                }
+                pthread_mutex_unlock(&ns->state_lock);
+
+                if (updated) {
+                    ns_save_metadata(ns);
+                    log_message(LOG_INFO, "NS", "Updated stats for '%s' (size=%lld, words=%lld, chars=%lld)",
+                                filename, size, words, chars);
+                }
+            }
+        } else {
+            log_message(LOG_WARNING, "NS", "Unhandled SS command '%s' from %s:%d", command, ctx->peer_ip, ctx->peer_port);
+        }
 
         protocol_free_message(&cmd_msg);
         free(raw_command);

@@ -432,6 +432,10 @@ static void ss_load_existing_files(StorageServer *ss) {
             continue;
         }
 
+        if (strstr(name, ".ckpt_") != NULL) {
+            continue;
+        }
+
         ss_add_file_record(ss, name);
     }
 
@@ -634,6 +638,23 @@ static int ss_emit_file_list(StorageServer *ss) {
         char read_acl_buf[MAX_FIELD_SIZE] = {0};
         char write_acl_buf[MAX_FIELD_SIZE] = {0};
 
+        long size = get_file_size(node->filepath);
+        int words = 0;
+        int chars = 0;
+        char *content = ss_read_file_content(node->filepath);
+        if (content) {
+            words = count_words(content);
+            chars = count_chars(content);
+            free(content);
+        }
+
+        char size_buf[32];
+        char word_buf[32];
+        char char_buf[32];
+        snprintf(size_buf, sizeof(size_buf), "%ld", size);
+        snprintf(word_buf, sizeof(word_buf), "%d", words);
+        snprintf(char_buf, sizeof(char_buf), "%d", chars);
+
         if (ss_join_acl((const char (*)[MAX_USERNAME_LENGTH])node->read_users, node->read_count, read_acl_buf, sizeof(read_acl_buf)) != 0) {
             log_message(LOG_ERROR, "SS", "Failed to serialize read ACL for %s", node->filename);
             read_acl_buf[0] = '\0';
@@ -643,8 +664,16 @@ static int ss_emit_file_list(StorageServer *ss) {
             write_acl_buf[0] = '\0';
         }
 
-        const char *fields[] = {MSG_SS_HAS_FILE, node->filename, owner, read_acl_buf, write_acl_buf};
-        char *msg = protocol_build_message(fields, 5);
+        const char *fields[] = {
+            MSG_SS_HAS_FILE,
+            node->filename,
+            owner,
+            read_acl_buf,
+            write_acl_buf,
+            size_buf,
+            word_buf,
+            char_buf};
+        char *msg = protocol_build_message(fields, 8);
         if (!msg) {
             pthread_mutex_unlock(&ss->files_lock);
             return -1;
@@ -1955,6 +1984,31 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
     }
 
     log_message(LOG_INFO, "SS", "Write committed on %s by %s", rec->filename, username_copy);
+
+    long new_size = get_file_size(rec->filepath);
+    int new_words = 0;
+    int new_chars = 0;
+
+    char *final_content = ss_read_file_content(rec->filepath);
+    if (final_content) {
+        new_words = count_words(final_content);
+        new_chars = count_chars(final_content);
+        free(final_content);
+    }
+
+    char size_buf[32];
+    char word_buf[32];
+    char char_buf[32];
+    snprintf(size_buf, sizeof(size_buf), "%ld", new_size);
+    snprintf(word_buf, sizeof(word_buf), "%d", new_words);
+    snprintf(char_buf, sizeof(char_buf), "%d", new_chars);
+
+    const char *sync_fields[] = {MSG_WRITE_COMPLETE, rec->filename, size_buf, word_buf, char_buf};
+    char *sync_msg = protocol_build_message(sync_fields, 5);
+    if (sync_msg) {
+        protocol_send_message(ss->ns_sockfd, sync_msg);
+        free(sync_msg);
+    }
 }
 
 static void handle_client_checkpoint(StorageServer *ss, int fd, ProtocolMessage *msg) {

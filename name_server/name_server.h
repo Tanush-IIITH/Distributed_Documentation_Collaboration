@@ -18,6 +18,8 @@ typedef struct {
     char ss_ip[MAX_IP_LENGTH];
     int ss_port;
     long long size;
+    long long word_count;
+    long long char_count;
     time_t created;
     time_t modified;
     time_t last_access;
