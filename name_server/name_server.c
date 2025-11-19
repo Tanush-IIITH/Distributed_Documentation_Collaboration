@@ -2837,9 +2837,19 @@ int ns_start(NameServer *ns) {
         return -1;
     }
 
+
     ns->sockfd = listen_fd;
     log_message(LOG_INFO, "NS", "Name Server listening on port %d", ns->port);
 
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        log_message(LOG_ERROR, "NS", "Failed to init thread attributes: %s", strerror(errno));
+    }
+
+    size_t stack_size = 4 * 1024 * 1024; 
+    if (pthread_attr_setstacksize(&attr, stack_size) != 0) {
+        log_message(LOG_ERROR, "NS", "Failed to set stack size: %s", strerror(errno));
+    }
     while (1) {
         struct sockaddr_in peer_addr;
         socklen_t peer_len = sizeof(peer_addr);
@@ -2880,7 +2890,7 @@ int ns_start(NameServer *ns) {
 
         pthread_t thread_id;
         //call the connection_thread function to handle the connection and detach subsequently
-        if (pthread_create(&thread_id, NULL, connection_thread, ctx) != 0) {
+        if (pthread_create(&thread_id, &attr, connection_thread, ctx) != 0) {
             log_message(LOG_ERROR, "NS", "Failed to spawn thread for %s:%d: %s", peer_ip, peer_port, strerror(errno));
             close(conn_fd);
             free(ctx);
