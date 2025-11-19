@@ -66,19 +66,40 @@ int protocol_parse_message(const char *raw, ProtocolMessage *msg) {
         return -1;
     }
 
-    // Tokenize by delimiter
-    char *token = strtok(work_copy, PROTOCOL_DELIMITER);
+    size_t delimiter_len = strlen(PROTOCOL_DELIMITER);
+    char *current = work_copy;
     msg->field_count = 0;
 
-    while (token != NULL && msg->field_count < MAX_FIELDS) {
-        msg->fields[msg->field_count] = strdup(token);
+    while (current && msg->field_count < MAX_FIELDS) {
+        char *next_delimiter = strstr(current, PROTOCOL_DELIMITER);
+        if (next_delimiter) {
+            *next_delimiter = '\0';
+        }
+
+        msg->fields[msg->field_count] = strdup(current);
         if (!msg->fields[msg->field_count]) {
             free(work_copy);
             protocol_free_message(msg);
             return -1;
         }
         msg->field_count++;
-        token = strtok(NULL, PROTOCOL_DELIMITER);
+
+        if (!next_delimiter) {
+            break;
+        }
+        current = next_delimiter + delimiter_len;
+        if (*current == '\0') {
+            if (msg->field_count < MAX_FIELDS) {
+                msg->fields[msg->field_count] = strdup("");
+                if (!msg->fields[msg->field_count]) {
+                    free(work_copy);
+                    protocol_free_message(msg);
+                    return -1;
+                }
+                msg->field_count++;
+            }
+            break;
+        }
     }
 
     free(work_copy);
