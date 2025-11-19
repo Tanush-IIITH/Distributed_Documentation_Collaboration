@@ -1878,6 +1878,14 @@ static void run_client_loop(ConnectionContext *ctx) {
                                             pthread_mutex_unlock(&ns->state_lock);
                                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to retire file metadata.", ctx->peer_ip, ctx->peer_port);
                                         } else {
+                                            for (int i = 0; i < ns->request_count; i++) {
+                                                AccessRequest *req = &ns->access_requests[i];
+                                                if (req->is_pending && strcmp(req->filename, filename) == 0) {
+                                                    req->is_pending = 0;
+                                                    log_message(LOG_INFO, "NS", "Auto-cancelled request #%d for deleted file '%s'", req->id, filename);
+                                                }
+                                            }
+
                                             pthread_mutex_unlock(&ns->state_lock);
                                             char detail_buf[MAX_FIELD_SIZE];
                                             snprintf(detail_buf, sizeof(detail_buf), "File '%s' deleted successfully.", filename);
