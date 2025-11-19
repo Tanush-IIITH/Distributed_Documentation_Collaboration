@@ -1583,7 +1583,7 @@ static int ss_apply_word_edit(WriteSession *session, int word_index, const char 
         word_count = original_count + new_count;
         free(new_words);
     } else {
-        free(new_words);
+        free_words(new_words, new_count);
     }
 
     char *joined = join_words(words, word_count, delimiter);
@@ -1883,6 +1883,51 @@ static void handle_client_write_data(StorageServer *ss, int fd, ProtocolMessage 
     send_simple_ok(fd, "WRITE_DATA applied");
 }
 
+static int count_sentences_in_span(const char *text, size_t start, size_t end) {
+    if (!text || start >= end) {
+        return 0;
+    }
+
+    int count = 0;
+    for (size_t i = start; i < end; i++) {
+        if (is_sentence_delimiter((unsigned char)text[i])) {
+            count++;
+        }
+    }
+
+    if (count == 0) {
+        count = 1;
+    }
+
+    return count;
+}
+
+static void ss_update_active_sessions(StorageServer *ss, FileRecord *rec,
+                                      size_t edit_start, size_t old_len, size_t new_len,
+                                      int sentence_delta, WriteSession *exclude_session) {
+    ssize_t char_delta = (ssize_t)new_len - (ssize_t)old_len;
+    size_t edit_end = edit_start + old_len;
+
+    pthread_mutex_lock(&ss->sessions_lock);
+    for (WriteSession *s = ss->sessions; s; s = s->next) {
+        if (s == exclude_session || s->file != rec) {
+            continue;
+        }
+
+        if (s->sentence_start >= edit_end) {
+            s->sentence_start = (size_t)((ssize_t)s->sentence_start + char_delta);
+            s->sentence_end = (size_t)((ssize_t)s->sentence_end + char_delta);
+            if (sentence_delta != 0) {
+                s->sentence_index += sentence_delta;
+                if (s->sentence_index < 0) {
+                    s->sentence_index = 0;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&ss->sessions_lock);
+}
+
 static void handle_client_etirw(StorageServer *ss, int fd) {
     pthread_mutex_lock(&ss->sessions_lock);
     WriteSession *session = ss_find_session(ss, fd);
@@ -1893,6 +1938,8 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
     }
 
     FileRecord *rec = session->file;
+    size_t locked_start = session->sentence_start;
+    size_t locked_end = session->sentence_end;
     pthread_mutex_unlock(&ss->sessions_lock);
 
     pthread_mutex_lock(&rec->file_lock);
@@ -1908,29 +1955,22 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
         return;
     }
 
-    size_t cur_start = 0;
-    size_t cur_end = 0;
-    if (ss_get_sentence_bounds(current_snapshot, session->sentence_index, &cur_start, &cur_end) != 0) {
-        free(current_snapshot);
-        pthread_mutex_unlock(&rec->file_lock);
-        send_error_response(fd, ERR_INVALID_REQUEST, "Sentence layout changed; restart WRITE");
-        pthread_mutex_lock(&ss->sessions_lock);
-        WriteSession *detached = ss_detach_session(ss, fd);
-        pthread_mutex_unlock(&ss->sessions_lock);
-        ss_free_session(detached);
-        return;
-    }
-
     size_t base_len = strlen(current_snapshot);
-    size_t replacement_len = strlen(replacement);
-    if (cur_start > base_len || cur_end > base_len || cur_start > cur_end) {
+    if (locked_start > base_len || locked_end > base_len || locked_start > locked_end) {
         free(current_snapshot);
         pthread_mutex_unlock(&rec->file_lock);
         send_error_response(fd, ERR_INTERNAL_ERROR, "Invalid sentence bounds");
         return;
     }
 
-    size_t new_len = cur_start + replacement_len + (base_len - cur_end);
+    size_t old_len = locked_end - locked_start;
+    size_t replacement_len = strlen(replacement);
+
+    int old_sentences = count_sentences_in_span(current_snapshot, locked_start, locked_end);
+    int new_sentences = count_sentences_in_span(replacement, 0, replacement_len);
+    int sentence_delta = new_sentences - old_sentences;
+
+    size_t new_len = locked_start + replacement_len + (base_len - locked_end);
     char *new_content = (char *)safe_malloc(new_len + 1);
     if (!new_content) {
         free(current_snapshot);
@@ -1939,11 +1979,11 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
         return;
     }
 
-    memcpy(new_content, current_snapshot, cur_start);
-    memcpy(new_content + cur_start, replacement, replacement_len);
-    memcpy(new_content + cur_start + replacement_len,
-           current_snapshot + cur_end,
-           base_len - cur_end);
+    memcpy(new_content, current_snapshot, locked_start);
+    memcpy(new_content + locked_start, replacement, replacement_len);
+    memcpy(new_content + locked_start + replacement_len,
+           current_snapshot + locked_end,
+           base_len - locked_end);
     new_content[new_len] = '\0';
 
     if (ss_write_file_content(rec->undopath, current_snapshot) != 0) {
@@ -1966,6 +2006,8 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
 
     rec->undo_available = 1;
     ss_touch_file_metadata(rec, session->username, 1);
+
+    ss_update_active_sessions(ss, rec, locked_start, old_len, replacement_len, sentence_delta, session);
 
     pthread_mutex_unlock(&rec->file_lock);
 
