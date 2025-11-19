@@ -2051,19 +2051,55 @@ void client_cleanup(Client *client) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s <username> <ns_ip> <ns_port>\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <ns_ip> <ns_port>\n", argv[0]);
         return 1;
     }
-    
-    // Initialize logging
+
+    // Initialize logging before any meaningful work
     log_init("client.log", LOG_INFO);
     log_set_console(0);
-    
+
+    // Prompt for username before attempting any network calls
+    char username[MAX_USERNAME_LENGTH];
+    while (1) {
+        printf("Enter username: ");
+        fflush(stdout);
+
+        if (!fgets(username, sizeof(username), stdin)) {
+            fprintf(stderr, "Failed to read username\n");
+            log_cleanup();
+            return 1;
+        }
+
+        if (!strchr(username, '\n')) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {
+                // discard leftover characters for overly long usernames
+            }
+        }
+
+        trim_string(username);
+        if (username[0] == '\0') {
+            printf("Username cannot be empty.\n");
+            continue;
+        }
+
+        if (!validate_username(username)) {
+            printf("Invalid username. Please try again.\n");
+            continue;
+        }
+
+        break;
+    }
+
+    int ns_port = atoi(argv[2]);
+
     // Create client
     Client client;
-    if (client_init(&client, argv[1], argv[2], atoi(argv[3])) != 0) {
+    if (client_init(&client, username, argv[1], ns_port) != 0) {
         fprintf(stderr, "Failed to initialize client\n");
+        log_cleanup();
         return 1;
     }
     
@@ -2071,6 +2107,7 @@ int main(int argc, char *argv[]) {
     if (client_connect_to_ns(&client) != 0) {
         fprintf(stderr, "Failed to connect to Name Server\n");
         client_cleanup(&client);
+        log_cleanup();
         return 1;
     }
     
