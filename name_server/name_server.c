@@ -2041,6 +2041,18 @@ static void run_client_loop(ConnectionContext *ctx) {
                             break;
                         }
 
+                        if (strncmp(file->owner, target_user, MAX_USERNAME_LENGTH) == 0) {
+                            char detail[MAX_FIELD_SIZE];
+                            snprintf(detail, sizeof(detail), "Owner '%s' already has full access.", target_user);
+                            char *resp = protocol_build_ok(detail);
+                            if (resp) {
+                                protocol_send_message(ctx->conn_fd, resp);
+                                free(resp);
+                            }
+                            error_sent = 1;
+                            break;
+                        }
+
                         if (file_add_access(file, target_user, grant_read, grant_write) != 0) {
                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to update ACL.", ctx->peer_ip, ctx->peer_port);
                             error_sent = 1;
