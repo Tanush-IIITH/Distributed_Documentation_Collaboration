@@ -38,6 +38,8 @@ typedef struct {
     int sockfd;
     int is_alive;
     time_t last_heartbeat;
+    long long total_bytes;
+    int total_files;
     pthread_mutex_t comm_lock;
     pthread_cond_t response_cond;
     int awaiting_response;

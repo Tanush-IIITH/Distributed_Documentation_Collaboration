@@ -15,6 +15,8 @@
 
 static void ns_save_metadata(NameServer *ns);
 static void ns_load_metadata(NameServer *ns);
+static void ns_recalculate_server_load_locked(NameServer *ns, StorageServerInfo *ss);
+static StorageServerInfo *ns_select_storage_server_balanced(NameServer *ns);
 
 // Initialize the Name Server
 int ns_init(NameServer *ns, int port) {
@@ -202,6 +204,66 @@ static void storage_server_signal_failure(StorageServerInfo *ss) {
         pthread_cond_broadcast(&ss->response_cond);
     }
     pthread_mutex_unlock(&ss->comm_lock);
+}
+
+// recompute file/byte load for a storage server using the name server's in-memory metadata
+static void ns_recalculate_server_load_locked(NameServer *ns, StorageServerInfo *ss) {
+    if (!ns || !ss) {
+        return;
+    }
+
+    long long bytes = 0;
+    int files = 0;
+
+    for (int i = 0; i < ns->file_count; i++) {
+        FileMetadata *meta = &ns->files[i];
+        if (strncmp(meta->ss_ip, ss->client_ip, MAX_IP_LENGTH) == 0 && meta->ss_port == ss->client_port) {
+            files++;
+            if (meta->size > 0) {
+                bytes += meta->size;
+            }
+        }
+    }
+
+    ss->total_files = files;
+    ss->total_bytes = bytes < 0 ? 0 : bytes;
+}
+
+// choose the alive storage server with the lightest load; prioritize bytes then file count
+static StorageServerInfo *ns_select_storage_server_balanced(NameServer *ns) {
+    if (!ns || ns->ss_count == 0) {
+        return NULL;
+    }
+
+    StorageServerInfo *best = NULL;
+    int best_index = -1;
+
+    for (int offset = 0; offset < ns->ss_count; offset++) {
+        int idx = (ns->ss_round_robin_index + offset) % ns->ss_count;
+        StorageServerInfo *candidate = ns->storage_servers[idx];
+        if (!candidate || !candidate->is_alive) {
+            continue;
+        }
+
+        if (candidate->total_files < 0) {
+            candidate->total_files = 0;
+        }
+        if (candidate->total_bytes < 0) {
+            candidate->total_bytes = 0;
+        }
+
+        if (!best || candidate->total_bytes < best->total_bytes ||
+            (candidate->total_bytes == best->total_bytes && candidate->total_files < best->total_files)) {
+            best = candidate;
+            best_index = idx;
+        }
+    }
+
+    if (best && best_index >= 0) {
+        ns->ss_round_robin_index = (best_index + 1) % ns->ss_count;
+    }
+
+    return best;
 }
 
 // send a request to the storage server and block until the paired response arrives
@@ -1644,19 +1706,8 @@ static void run_client_loop(ConnectionContext *ctx) {
                         pthread_mutex_unlock(&ns->state_lock);
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "No storage servers available.", ctx->peer_ip, ctx->peer_port);
                     } else {
-                        // Select a storage server using round-robin load balancing
-                        int start_index = ns->ss_round_robin_index;
-
-                        for (int i = 0; i < ns->ss_count; i++) {
-                            int current_index = (start_index + i) % ns->ss_count;
-                            StorageServerInfo *candidate = ns->storage_servers[current_index];
-                            if (!candidate || !candidate->is_alive) {
-                                continue;
-                            }
-                            target_ss = candidate;
-                            ns->ss_round_robin_index = (current_index + 1) % ns->ss_count;
-                            break;
-                        }
+                        // Select the storage server with the lowest current load
+                        target_ss = ns_select_storage_server_balanced(ns);
 
                         if (!target_ss) {
                             // Handle the case where no alive storage servers are available
@@ -1785,6 +1836,14 @@ static void run_client_loop(ConnectionContext *ctx) {
                                     }
                                 }
 
+                                if (persist_metadata) {
+                                    pthread_mutex_lock(&ns->state_lock);
+                                    if (target_ss) {
+                                        target_ss->total_files++;
+                                    }
+                                    pthread_mutex_unlock(&ns->state_lock);
+                                }
+
                                 if (target_ss_acquired) {
                                     storage_server_release(target_ss);
                                     target_ss_acquired = 0;
@@ -1874,10 +1933,34 @@ static void run_client_loop(ConnectionContext *ctx) {
                                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected SS response.", ctx->peer_ip, ctx->peer_port);
                                     } else {
                                         pthread_mutex_lock(&ns->state_lock);
+                                        long long removed_size = 0;
+                                        int belongs_to_target = 0;
+                                        int temp_index = -1;
+                                        FileMetadata *current_meta = file_lookup_locked(ns, filename, &temp_index);
+                                        if (current_meta) {
+                                            removed_size = current_meta->size;
+                                            if (strncmp(current_meta->ss_ip, target_ss->client_ip, MAX_IP_LENGTH) == 0 &&
+                                                current_meta->ss_port == target_ss->client_port) {
+                                                belongs_to_target = 1;
+                                            }
+                                        }
+
                                         if (!remove_file_metadata_locked(ns, filename)) {
                                             pthread_mutex_unlock(&ns->state_lock);
                                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to retire file metadata.", ctx->peer_ip, ctx->peer_port);
                                         } else {
+                                            if (belongs_to_target) {
+                                                if (target_ss->total_files > 0) {
+                                                    target_ss->total_files--;
+                                                }
+                                                if (removed_size > 0) {
+                                                    if (target_ss->total_bytes >= removed_size) {
+                                                        target_ss->total_bytes -= removed_size;
+                                                    } else {
+                                                        target_ss->total_bytes = 0;
+                                                    }
+                                                }
+                                            }
                                             for (int i = 0; i < ns->request_count; i++) {
                                                 AccessRequest *req = &ns->access_requests[i];
                                                 if (req->is_pending && strcmp(req->filename, filename) == 0) {
@@ -2378,6 +2461,15 @@ static void run_ss_loop(ConnectionContext *ctx) {
 
     NameServer *ns = ctx->ns;
     StorageServerInfo *ss = ctx->ss_info;
+    int load_reset_done = 0;
+
+    if (ss) {
+        pthread_mutex_lock(&ns->state_lock);
+        ss->total_bytes = 0;
+        ss->total_files = 0;
+        pthread_mutex_unlock(&ns->state_lock);
+        load_reset_done = 1;
+    }
 
     // Get storage server information
     while (1) {
@@ -2386,6 +2478,38 @@ static void run_ss_loop(ConnectionContext *ctx) {
             log_message(LOG_WARNING, "NS", "SS %s:%d disconnected during file sync.", ctx->peer_ip, ctx->peer_port);
             storage_server_signal_failure(ss);
             return;
+        }
+
+        StorageServerInfo *ss_entry = ss;
+        if (!ss_entry) {
+            pthread_mutex_lock(&ns->state_lock);
+            ss_entry = find_storage_server_by_sockfd(ns, ctx->conn_fd);
+            if (ss_entry) {
+                ctx->ss_info = ss_entry;
+                ss = ss_entry;
+            }
+            pthread_mutex_unlock(&ns->state_lock);
+        }
+
+        int dispatched_to_waiter = 0;
+        if (ss_entry) {
+            pthread_mutex_lock(&ss_entry->comm_lock);
+            if (ss_entry->awaiting_response && !ss_entry->response_ready) {
+                if (ss_entry->response_raw) {
+                    free(ss_entry->response_raw);
+                }
+                ss_entry->response_raw = file_msg_raw;
+                ss_entry->response_status = 0;
+                ss_entry->response_ready = 1;
+                ss_entry->awaiting_response = 0;
+                pthread_cond_broadcast(&ss_entry->response_cond);
+                dispatched_to_waiter = 1;
+            }
+            pthread_mutex_unlock(&ss_entry->comm_lock);
+        }
+
+        if (dispatched_to_waiter) {
+            continue;
         }
 
         ProtocolMessage file_msg;
@@ -2425,12 +2549,17 @@ static void run_ss_loop(ConnectionContext *ctx) {
             }
 
             pthread_mutex_lock(&ns->state_lock);
-            StorageServerInfo *ss_entry = ss;
+            ss_entry = ss;
             if (!ss_entry) {
                 ss_entry = find_storage_server_by_sockfd(ns, ctx->conn_fd);
                 if (ss_entry) {
                     ctx->ss_info = ss_entry;
                     ss = ss_entry;
+                    if (!load_reset_done) {
+                        ss_entry->total_bytes = 0;
+                        ss_entry->total_files = 0;
+                        load_reset_done = 1;
+                    }
                 }
             }
             if (!ss_entry) {
@@ -2520,6 +2649,15 @@ static void run_ss_loop(ConnectionContext *ctx) {
 
             pthread_mutex_unlock(&ns->state_lock);
         } else if (strcmp(file_msg.fields[0], MSG_SS_FILES_DONE) == 0) {
+            if (!ss && ctx->ss_info) {
+                ss = ctx->ss_info;
+            }
+            pthread_mutex_lock(&ns->state_lock);
+            if (ss) {
+                ns_recalculate_server_load_locked(ns, ss);
+            }
+            pthread_mutex_unlock(&ns->state_lock);
+
             log_message(LOG_INFO, "NS", "SS %s:%d file sync complete.", ctx->peer_ip, ctx->peer_port);
             protocol_free_message(&file_msg);
             free(file_msg_raw);
@@ -2597,11 +2735,20 @@ static void run_ss_loop(ConnectionContext *ctx) {
                 FileIndexNode *node = file_index_find(ns, filename);
                 if (node && node->file_array_index >= 0 && node->file_array_index < ns->file_count) {
                     FileMetadata *file = &ns->files[node->file_array_index];
+                        long long previous_size = file->size;
                     file->size = size;
                     file->word_count = words;
                     file->char_count = chars;
                     file->modified = get_current_time();
                     file_cache_store(ns, filename, node->file_array_index);
+                        if (ss && strncmp(file->ss_ip, ss->client_ip, MAX_IP_LENGTH) == 0 &&
+                            file->ss_port == ss->client_port) {
+                            long long delta = size - previous_size;
+                            ss->total_bytes += delta;
+                            if (ss->total_bytes < 0) {
+                                ss->total_bytes = 0;
+                            }
+                        }
                     updated = 1;
                 } else {
                     log_message(LOG_WARNING, "NS", "WRITE_COMPLETE for unknown file '%s'", filename);
@@ -2939,6 +3086,8 @@ int ns_register_storage_server(NameServer *ns, const char *ns_ip, int ns_port,
     ss->sockfd = sockfd;
     ss->is_alive = 1;
     ss->last_heartbeat = get_current_time();
+    ss->total_bytes = 0;
+    ss->total_files = 0;
     storage_server_comm_init(ss);
 
     ns->storage_servers[ns->ss_count++] = ss;

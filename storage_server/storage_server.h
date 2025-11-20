@@ -36,6 +36,7 @@ typedef struct FileRecord {
     int undo_available;
     CheckpointRecord checkpoints[SS_MAX_CHECKPOINTS];
     int checkpoint_count;
+    int migrating;
     pthread_mutex_t file_lock;
     struct FileRecord *next;
 } FileRecord;

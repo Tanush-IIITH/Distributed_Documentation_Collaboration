@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <libgen.h>
 #include <arpa/inet.h>
+#include <stdint.h>
 
 // ============================================================================
 // GLOBAL VARIABLES
@@ -86,6 +87,17 @@ void log_request(const char *component, const char *source_ip, int source_port,
         fprintf(log_file_ptr, "%s\n", buffer);
         fflush(log_file_ptr);
     }
+}
+
+void log_migration_event(const char *filename, const char *source_ip, int source_port,
+                         const char *target_ip, int target_port, const char *status) {
+    if (!filename || !status || !source_ip || !target_ip) {
+        return;
+    }
+
+    LogLevel level = LOG_INFO;
+    log_message(level, "NS", "Migration %s for '%s' (%s:%d -> %s:%d)",
+                status, filename, source_ip, source_port, target_ip, target_port);
 }
 
 void log_cleanup(void) {
@@ -508,6 +520,164 @@ int count_chars(const char *text) {
 
 int is_sentence_delimiter(char c) {
     return c == '.' || c == '!' || c == '?';
+}
+
+int parse_long_long(const char *text, long long *out_value) {
+    if (!text || !out_value || !*text) {
+        return -1;
+    }
+
+    errno = 0;
+    char *endptr = NULL;
+    long long value = strtoll(text, &endptr, 10);
+    if (errno != 0 || !endptr || *endptr != '\0') {
+        return -1;
+    }
+
+    *out_value = value;
+    return 0;
+}
+
+int parse_double(const char *text, double *out_value) {
+    if (!text || !out_value || !*text) {
+        return -1;
+    }
+
+    errno = 0;
+    char *endptr = NULL;
+    double value = strtod(text, &endptr);
+    if (errno != 0 || !endptr || *endptr != '\0') {
+        return -1;
+    }
+
+    *out_value = value;
+    return 0;
+}
+
+static const char BASE64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 26;
+    }
+    if (c >= '0' && c <= '9') {
+        return c - '0' + 52;
+    }
+    if (c == '+') {
+        return 62;
+    }
+    if (c == '/') {
+        return 63;
+    }
+    if (c == '=') {
+        return -2; // padding
+    }
+    return -1;
+}
+
+int base64_encode(const unsigned char *input, size_t input_length, char **output) {
+    if (!input || !output) {
+        return -1;
+    }
+
+    size_t output_length = 4 * ((input_length + 2) / 3);
+    char *encoded = (char *)malloc(output_length + 1);
+    if (!encoded) {
+        return -1;
+    }
+
+    size_t j = 0;
+    for (size_t i = 0; i < input_length; ) {
+        uint32_t octet_a = i < input_length ? input[i++] : 0;
+        uint32_t octet_b = i < input_length ? input[i++] : 0;
+        uint32_t octet_c = i < input_length ? input[i++] : 0;
+
+        uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+        encoded[j++] = BASE64_TABLE[(triple >> 18) & 0x3F];
+        encoded[j++] = BASE64_TABLE[(triple >> 12) & 0x3F];
+        encoded[j++] = BASE64_TABLE[(triple >> 6) & 0x3F];
+        encoded[j++] = BASE64_TABLE[triple & 0x3F];
+    }
+
+    size_t mod = input_length % 3;
+    if (mod > 0) {
+        encoded[output_length - 1] = '=';
+        if (mod == 1) {
+            encoded[output_length - 2] = '=';
+        }
+    }
+
+    encoded[output_length] = '\0';
+    *output = encoded;
+    return 0;
+}
+
+int base64_decode(const char *input, unsigned char **output, size_t *output_length) {
+    if (!input || !output || !output_length) {
+        return -1;
+    }
+
+    size_t input_length = strlen(input);
+    if (input_length == 0 || input_length % 4 != 0) {
+        return -1;
+    }
+
+    size_t padding = 0;
+    if (input_length >= 2) {
+        if (input[input_length - 1] == '=') {
+            padding++;
+        }
+        if (input[input_length - 2] == '=') {
+            padding++;
+        }
+    }
+
+    size_t decoded_length = (input_length / 4) * 3 - padding;
+    unsigned char *decoded = (unsigned char *)malloc(decoded_length + 1);
+    if (!decoded) {
+        return -1;
+    }
+
+    size_t in_index = 0;
+    size_t out_index = 0;
+    while (in_index < input_length) {
+        int sextet_a = base64_value((unsigned char)input[in_index++]);
+        int sextet_b = base64_value((unsigned char)input[in_index++]);
+        int sextet_c = base64_value((unsigned char)input[in_index++]);
+        int sextet_d = base64_value((unsigned char)input[in_index++]);
+
+        if (sextet_a < 0 || sextet_b < 0 || sextet_c < -1 || sextet_d < -1) {
+            free(decoded);
+            return -1;
+        }
+
+        uint32_t triple = ((uint32_t)sextet_a << 18) | ((uint32_t)sextet_b << 12);
+        if (sextet_c >= 0) {
+            triple |= ((uint32_t)sextet_c << 6);
+        }
+        if (sextet_d >= 0) {
+            triple |= (uint32_t)sextet_d;
+        }
+
+        if (out_index < decoded_length) {
+            decoded[out_index++] = (unsigned char)((triple >> 16) & 0xFF);
+        }
+        if (sextet_c >= 0 && out_index < decoded_length) {
+            decoded[out_index++] = (unsigned char)((triple >> 8) & 0xFF);
+        }
+        if (sextet_d >= 0 && out_index < decoded_length) {
+            decoded[out_index++] = (unsigned char)(triple & 0xFF);
+        }
+    }
+
+    decoded[decoded_length] = '\0';
+    *output = decoded;
+    *output_length = decoded_length;
+    return 0;
 }
 
 int count_sentences(const char *text) {

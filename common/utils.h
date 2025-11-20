@@ -51,6 +51,12 @@ void log_request(const char *component, const char *source_ip, int source_port,
                  const char *request);
 
 /**
+ * Log a migration lifecycle event, recording source/target endpoints.
+ */
+void log_migration_event(const char *filename, const char *source_ip, int source_port,
+                         const char *target_ip, int target_port, const char *status);
+
+/**
  * Close logging system
  */
 void log_cleanup(void);
@@ -307,5 +313,17 @@ char* replace_word_in_sentence(const char *sentence, int word_index, const char 
  * Returns 1 if delimiter, 0 otherwise
  */
 int is_sentence_delimiter(char c);
+
+/// Parse string to long long with validation.
+int parse_long_long(const char *text, long long *out_value);
+
+/// Parse string to double with validation.
+int parse_double(const char *text, double *out_value);
+
+/// Encode binary data into Base64. Caller must free *output on success.
+int base64_encode(const unsigned char *input, size_t input_length, char **output);
+
+/// Decode Base64 string into binary data. Caller must free *output on success.
+int base64_decode(const char *input, unsigned char **output, size_t *output_length);
 
 #endif // UTILS_H

@@ -177,6 +177,14 @@
 // SS -> NS: PONG\n
 #define MSG_PONG "PONG"
 
+// Load Balancing / Migration
+// NS -> SS_Source: PREP_MIGRATION|filename\n
+#define MSG_PREP_MIGRATION "PREP_MIGRATION"
+// NS -> SS_Target: IMPORT_FILE|filename|source_ip|source_port|owner|read_acl|write_acl|created|modified|last_access|size|words|chars\n
+#define MSG_IMPORT_FILE "IMPORT_FILE"
+// NS -> SS_Source: MIGRATION_CLEANUP|filename|action(COMMIT|ROLLBACK)\n
+#define MSG_MIGRATION_CLEANUP "MIGRATION_CLEANUP"
+
 // ============================================================================
 // RESPONSE TYPES - SUCCESS
 // ============================================================================
@@ -195,6 +203,9 @@
 #define RESP_OK_UNDO "OK_UNDO"
 #define RESP_OK_CHECKPOINT "OK_CHECKPOINT"
 #define RESP_OK_REVERT "OK_REVERT"
+#define RESP_OK_MIGRATION_READY "OK_MIGRATION_READY"
+#define RESP_OK_IMPORT_DONE "OK_IMPORT_DONE"
+#define RESP_OK_MIGRATION_CLEANED "OK_MIGRATION_CLEANED"
 
 // List responses
 #define RESP_OK_LIST "OK_LIST"
