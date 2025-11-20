@@ -1291,7 +1291,6 @@ static void run_client_loop(ConnectionContext *ctx) {
                     char *ss_resp_raw = NULL;
                     ProtocolMessage content_msg;
                     int content_msg_valid = 0;
-                    int metadata_dirty = 0;
                     FILE *pipe = NULL;
 
                     do {
@@ -1300,10 +1299,6 @@ static void run_client_loop(ConnectionContext *ctx) {
                         FileMetadata *file = file_lookup_locked(ns, filename, &file_index);
                         if (!file) {
                             pthread_mutex_unlock(&ns->state_lock);
-                            if (metadata_dirty) {
-                                ns_save_metadata(ns);
-                                metadata_dirty = 0;
-                            }
                             send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found.", ctx->peer_ip, ctx->peer_port);
                             break;
                         }
@@ -1311,30 +1306,32 @@ static void run_client_loop(ConnectionContext *ctx) {
                         FileMetadata file_snapshot = *file;
                         if (!file_has_read_access(&file_snapshot, ctx->username)) {
                             pthread_mutex_unlock(&ns->state_lock);
-                            if (metadata_dirty) {
-                                ns_save_metadata(ns);
-                                metadata_dirty = 0;
-                            }
                             send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "User lacks read access for EXEC.", ctx->peer_ip, ctx->peer_port);
                             break;
                         }
 
-                        time_t now = get_current_time();
-                        file->last_access = now;
-                        safe_strcpy(file->last_access_user, ctx->username, sizeof(file->last_access_user));
-                        metadata_dirty = 1;
-                        file_snapshot = *file;
-
                         if (file_index >= 0) {
                             file_cache_store(ns, file_snapshot.filename, file_index);
                         }
+                        pthread_mutex_unlock(&ns->state_lock);
+
+                        int exec_dirty = 0;
+                        pthread_mutex_lock(&ns->state_lock);
+                        FileIndexNode *update_node = file_index_find(ns, filename);
+                        if (update_node && update_node->file_array_index >= 0) {
+                            FileMetadata *real_file = &ns->files[update_node->file_array_index];
+                            real_file->last_access = get_current_time();
+                            safe_strcpy(real_file->last_access_user, ctx->username, sizeof(real_file->last_access_user));
+                            exec_dirty = 1;
+                            file_snapshot.last_access = real_file->last_access;
+                            safe_strcpy(file_snapshot.last_access_user, real_file->last_access_user, sizeof(file_snapshot.last_access_user));
+                        }
+                        pthread_mutex_unlock(&ns->state_lock);
+                        if (exec_dirty) {
+                            ns_save_metadata(ns);
+                        }
 
                         if (safe_strcpy(resolved_filename, file_snapshot.filename, sizeof(resolved_filename)) != 0) {
-                            pthread_mutex_unlock(&ns->state_lock);
-                            if (metadata_dirty) {
-                                ns_save_metadata(ns);
-                                metadata_dirty = 0;
-                            }
                             send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to resolve filename for EXEC.", ctx->peer_ip, ctx->peer_port);
                             break;
                         }
@@ -1351,12 +1348,6 @@ static void run_client_loop(ConnectionContext *ctx) {
                                 target_ss_acquired = 1;
                                 break;
                             }
-                        }
-
-                        pthread_mutex_unlock(&ns->state_lock);
-                        if (metadata_dirty) {
-                            ns_save_metadata(ns);
-                            metadata_dirty = 0;
                         }
 
                         if (!target_ss) {
@@ -1991,7 +1982,6 @@ static void run_client_loop(ConnectionContext *ctx) {
                 int have_access = 0;
                 int file_exists = 0;
                 int operation_known = 1;
-                int operation_is_destructive = 0;
                 int metadata_dirty = 0;
 
                 pthread_mutex_lock(&ns->state_lock);
@@ -2004,18 +1994,14 @@ static void run_client_loop(ConnectionContext *ctx) {
                         have_access = file_has_read_access(file, ctx->username);
                     } else if (strcasecmp(operation, "WRITE") == 0) {
                         have_access = file_has_write_access(file, ctx->username);
-                        operation_is_destructive = 1;
                     } else if (strcasecmp(operation, "STREAM") == 0) {
                         have_access = file_has_read_access(file, ctx->username);
                     } else if (strcasecmp(operation, "CHECKPOINT") == 0) {
                         have_access = file_has_write_access(file, ctx->username);
-                        operation_is_destructive = 1;
                     } else if (strcasecmp(operation, "REVERT") == 0) {
                         have_access = file_has_write_access(file, ctx->username);
-                        operation_is_destructive = 1;
                     } else if (strcasecmp(operation, "UNDO") == 0) {
                         have_access = file_has_write_access(file, ctx->username);
-                        operation_is_destructive = 1;
                     } else if (strcasecmp(operation, "VIEWCHECKPOINT") == 0) {
                         have_access = file_has_read_access(file, ctx->username);
                     } else if (strcasecmp(operation, "LISTCHECKPOINTS") == 0) {
@@ -2027,14 +2013,29 @@ static void run_client_loop(ConnectionContext *ctx) {
                     }
 
                     if (operation_known && have_access) {
-                        time_t now = get_current_time();
-                        file->last_access = now;
-                        safe_strcpy(file->last_access_user, ctx->username, sizeof(file->last_access_user));
-                        if (operation_is_destructive) {
+                        int dirty = 0;
+
+                        if (!operation || operation[0] == '\0' ||
+                            strcasecmp(operation, "READ") == 0 ||
+                            strcasecmp(operation, "STREAM") == 0) {
+                            time_t now = get_current_time();
+                            file->last_access = now;
+                            safe_strcpy(file->last_access_user, ctx->username, sizeof(file->last_access_user));
+                            dirty = 1;
+                        } else if (strcasecmp(operation, "WRITE") == 0 ||
+                                   strcasecmp(operation, "UNDO") == 0 ||
+                                   strcasecmp(operation, "REVERT") == 0 ||
+                                   strcasecmp(operation, "CHECKPOINT") == 0) {
+                            time_t now = get_current_time();
                             file->modified = now;
                             safe_strcpy(file->last_modified_user, ctx->username, sizeof(file->last_modified_user));
+                            dirty = 1;
                         }
-                        metadata_dirty = 1;
+
+                        if (dirty) {
+                            metadata_dirty = 1;
+                        }
+
                         file_snapshot = *file;
                         if (file_index >= 0) {
                             file_cache_store(ns, filename, file_index);
