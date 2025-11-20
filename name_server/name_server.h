@@ -23,6 +23,8 @@ typedef struct {
     time_t created;
     time_t modified;
     time_t last_access;
+    char last_access_user[MAX_USERNAME_LENGTH];
+    char last_modified_user[MAX_USERNAME_LENGTH];
     char read_access_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
     char write_access_users[NS_MAX_CLIENTS][MAX_USERNAME_LENGTH];
     int read_access_count;
