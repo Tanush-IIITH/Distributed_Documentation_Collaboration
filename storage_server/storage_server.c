@@ -24,6 +24,11 @@ static int ss_open_client_listener(StorageServer *ss);
 static void ss_send_ns_error(StorageServer *ss, int code, const char *message);
 static int ss_create_file(StorageServer *ss, const char *filename, const char *owner);
 static int ss_delete_file(StorageServer *ss, const char *filename);
+static int ss_handle_rename(StorageServer *ss, const char *old_logical, const char *new_logical,
+                            const char *old_flat, const char *new_flat);
+static void ss_set_record_paths(StorageServer *ss, FileRecord *rec, const char *logical_name);
+static int ss_load_metadata(StorageServer *ss, FileRecord *rec);
+static int ss_write_metadata(FileRecord *rec);
 static char *ss_read_file_content(const char *path);
 static int ss_write_file_content(const char *path, const char *data);
 static int ss_check_read_access(FileRecord *rec, const char *user);
@@ -248,23 +253,40 @@ static void ss_prune_oldest_checkpoint(FileRecord *rec) {
     rec->checkpoint_count--;
 }
 
-static void ss_init_file_record(FileRecord *rec, const char *filename, const char *base_path) {
-    memset(rec, 0, sizeof(FileRecord));
-    safe_strcpy(rec->filename, filename, sizeof(rec->filename));
-    build_path(rec->filepath, sizeof(rec->filepath), base_path, filename);
+static void ss_set_record_paths(StorageServer *ss, FileRecord *rec, const char *logical_name) {
+    if (!ss || !rec || !logical_name) {
+        return;
+    }
+
+    safe_strcpy(rec->filename, logical_name, sizeof(rec->filename));
+    if (flatten_logical_path(logical_name, rec->physical_name, sizeof(rec->physical_name)) != 0) {
+        safe_strcpy(rec->physical_name, logical_name, sizeof(rec->physical_name));
+    }
+
+    if (build_path(rec->filepath, sizeof(rec->filepath), ss->storage_path, rec->physical_name) != 0) {
+        rec->filepath[0] = '\0';
+    }
 
     char meta_name[MAX_FILENAME_LENGTH + 8];
-    snprintf(meta_name, sizeof(meta_name), "%s%s", filename, SS_META_SUFFIX);
-    build_path(rec->metapath, sizeof(rec->metapath), base_path, meta_name);
+    snprintf(meta_name, sizeof(meta_name), "%s%s", rec->physical_name, SS_META_SUFFIX);
+    if (build_path(rec->metapath, sizeof(rec->metapath), ss->storage_path, meta_name) != 0) {
+        rec->metapath[0] = '\0';
+    }
 
     char undo_name[MAX_FILENAME_LENGTH + 8];
-    snprintf(undo_name, sizeof(undo_name), "%s%s", filename, SS_UNDO_SUFFIX);
-    build_path(rec->undopath, sizeof(rec->undopath), base_path, undo_name);
+    snprintf(undo_name, sizeof(undo_name), "%s%s", rec->physical_name, SS_UNDO_SUFFIX);
+    if (build_path(rec->undopath, sizeof(rec->undopath), ss->storage_path, undo_name) != 0) {
+        rec->undopath[0] = '\0';
+    }
+}
 
+static void ss_init_file_record(StorageServer *ss, FileRecord *rec, const char *filename) {
+    memset(rec, 0, sizeof(FileRecord));
+    ss_set_record_paths(ss, rec, filename);
     pthread_mutex_init(&rec->file_lock, NULL);
 }
 
-static int ss_load_metadata(FileRecord *rec) {
+static int ss_load_metadata(StorageServer *ss, FileRecord *rec) {
     FILE *fp = fopen(rec->metapath, "r");
     if (!fp) {
         return -1;
@@ -274,10 +296,16 @@ static int ss_load_metadata(FileRecord *rec) {
     rec->write_count = 0;
     rec->undo_available = 0;
     rec->checkpoint_count = 0;
+
+    char logical_override[MAX_FILENAME_LENGTH];
+    logical_override[0] = '\0';
+
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
         trim_string(line);
-        if (strncmp(line, "OWNER=", 6) == 0) {
+        if (strncmp(line, "LOGICAL=", 8) == 0) {
+            safe_strcpy(logical_override, line + 8, sizeof(logical_override));
+        } else if (strncmp(line, "OWNER=", 6) == 0) {
             safe_strcpy(rec->owner, line + 6, sizeof(rec->owner));
         } else if (strncmp(line, "READ=", 5) == 0) {
             char *token = strtok(line + 5, ",");
@@ -330,6 +358,11 @@ static int ss_load_metadata(FileRecord *rec) {
     }
 
     fclose(fp);
+
+    if (logical_override[0] != '\0') {
+        ss_set_record_paths(ss, rec, logical_override);
+    }
+
     return 0;
 }
 
@@ -339,6 +372,7 @@ static int ss_write_metadata(FileRecord *rec) {
         return -1;
     }
 
+    fprintf(fp, "LOGICAL=%s\n", rec->filename);
     fprintf(fp, "OWNER=%s\n", rec->owner);
     fprintf(fp, "CREATED=%lld\n", (long long)rec->created);
     fprintf(fp, "MODIFIED=%lld\n", (long long)rec->modified);
@@ -383,8 +417,8 @@ static int ss_add_file_record(StorageServer *ss, const char *filename) {
         return -1;
     }
 
-    ss_init_file_record(rec, filename, ss->storage_path);
-    if (ss_load_metadata(rec) != 0) {
+    ss_init_file_record(ss, rec, filename);
+    if (ss_load_metadata(ss, rec) != 0) {
         rec->created = get_current_time();
         rec->modified = rec->created;
         rec->last_access = rec->created;
@@ -442,7 +476,7 @@ static void ss_load_existing_files(StorageServer *ss) {
     closedir(dir);
 }
 
-static void ss_touch_file_metadata(FileRecord *rec, const char *username, int update_modified) {
+static void ss_touch_file_metadata(StorageServer *ss, FileRecord *rec, const char *username, int update_modified) {
     time_t now = get_current_time();
     rec->last_access = now;
     if (username) {
@@ -856,6 +890,27 @@ static void *ns_control_loop(void *arg) {
                     }
                 }
             }
+        } else if (strcmp(command, MSG_SS_RENAME) == 0) {
+            if (msg.field_count < 5) {
+                ss_send_ns_error(ss, ERR_INVALID_REQUEST, "SS_RENAME missing fields");
+            } else {
+                const char *old_logical = msg.fields[1];
+                const char *new_logical = msg.fields[2];
+                const char *old_flat = msg.fields[3];
+                const char *new_flat = msg.fields[4];
+                if (!validate_filename(old_logical) || !validate_filename(new_logical)) {
+                    ss_send_ns_error(ss, ERR_INVALID_REQUEST, "Invalid logical path");
+                } else if (ss_handle_rename(ss, old_logical, new_logical, old_flat, new_flat) != 0) {
+                    ss_send_ns_error(ss, ERR_INTERNAL_ERROR, "Rename failed");
+                } else {
+                    const char *ok_fields[] = {RESP_OK};
+                    char *resp = protocol_build_message(ok_fields, 1);
+                    if (resp) {
+                        protocol_send_message(ss->ns_sockfd, resp);
+                        free(resp);
+                    }
+                }
+            }
         } else if (strcmp(command, MSG_SS_ADDACCESS) == 0) {
             if (msg.field_count < 4) {
                 ss_send_ns_error(ss, ERR_INVALID_REQUEST, "ADDACCESS missing fields");
@@ -1240,7 +1295,7 @@ static int ss_create_file(StorageServer *ss, const char *filename, const char *o
         return -1;
     }
 
-    ss_init_file_record(rec, filename, ss->storage_path);
+    ss_init_file_record(ss, rec, filename);
     if (owner) {
         safe_strcpy(rec->owner, owner, sizeof(rec->owner));
         safe_strcpy(rec->last_access_user, owner, sizeof(rec->last_access_user));
@@ -1314,6 +1369,71 @@ static int ss_delete_file(StorageServer *ss, const char *filename) {
     pthread_mutex_unlock(&ss->files_lock);
     pthread_mutex_destroy(&node->file_lock);
     free(node);
+    return 0;
+}
+
+static int ss_handle_rename(StorageServer *ss, const char *old_logical, const char *new_logical,
+                            const char *old_flat, const char *new_flat) {
+    if (!ss || !old_logical || !new_logical || !old_flat || !new_flat) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *rec = ss_find_file(ss, old_logical);
+    if (!rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        return -1;
+    }
+
+    pthread_mutex_lock(&rec->file_lock);
+    pthread_mutex_unlock(&ss->files_lock);
+
+    char expected_old_flat[MAX_FILENAME_LENGTH];
+    if (flatten_logical_path(rec->filename, expected_old_flat, sizeof(expected_old_flat)) != 0) {
+        pthread_mutex_unlock(&rec->file_lock);
+        return -1;
+    }
+
+    if (strncmp(expected_old_flat, old_flat, sizeof(expected_old_flat)) != 0) {
+        pthread_mutex_unlock(&rec->file_lock);
+        return -1;
+    }
+
+    char current_path[MAX_PATH_LENGTH];
+    char new_path[MAX_PATH_LENGTH];
+    if (build_path(current_path, sizeof(current_path), ss->storage_path, old_flat) != 0 ||
+        build_path(new_path, sizeof(new_path), ss->storage_path, new_flat) != 0) {
+        pthread_mutex_unlock(&rec->file_lock);
+        return -1;
+    }
+
+    char current_meta[MAX_PATH_LENGTH];
+    char new_meta[MAX_PATH_LENGTH];
+    char current_undo[MAX_PATH_LENGTH];
+    char new_undo[MAX_PATH_LENGTH];
+
+    snprintf(current_meta, sizeof(current_meta), "%s%s", current_path, SS_META_SUFFIX);
+    snprintf(new_meta, sizeof(new_meta), "%s%s", new_path, SS_META_SUFFIX);
+    snprintf(current_undo, sizeof(current_undo), "%s%s", current_path, SS_UNDO_SUFFIX);
+    snprintf(new_undo, sizeof(new_undo), "%s%s", new_path, SS_UNDO_SUFFIX);
+
+    if (rename(current_path, new_path) != 0) {
+        pthread_mutex_unlock(&rec->file_lock);
+        return -1;
+    }
+
+    rename(current_meta, new_meta);
+    rename(current_undo, new_undo);
+
+    safe_strcpy(rec->filename, new_logical, sizeof(rec->filename));
+    safe_strcpy(rec->physical_name, new_flat, sizeof(rec->physical_name));
+    safe_strcpy(rec->filepath, new_path, sizeof(rec->filepath));
+    safe_strcpy(rec->metapath, new_meta, sizeof(rec->metapath));
+    safe_strcpy(rec->undopath, new_undo, sizeof(rec->undopath));
+
+    ss_touch_file_metadata(ss, rec, NULL, 1);
+
+    pthread_mutex_unlock(&rec->file_lock);
     return 0;
 }
 
@@ -1653,7 +1773,7 @@ static void handle_client_read(StorageServer *ss, int fd, ProtocolMessage *msg) 
         free(end_msg);
     }
 
-    ss_touch_file_metadata(rec, username, 0);
+    ss_touch_file_metadata(ss, rec, username, 0);
     pthread_mutex_unlock(&rec->file_lock);
     free(content);
 }
@@ -1740,7 +1860,7 @@ static void handle_client_stream(StorageServer *ss, int fd, ProtocolMessage *msg
         free(end_msg);
     }
 
-    ss_touch_file_metadata(rec, username, 0);
+    ss_touch_file_metadata(ss, rec, username, 0);
     pthread_mutex_unlock(&rec->file_lock);
     free(content);
 }
@@ -2005,7 +2125,7 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
     free(new_content);
 
     rec->undo_available = 1;
-    ss_touch_file_metadata(rec, session->username, 1);
+    ss_touch_file_metadata(ss, rec, session->username, 1);
 
     ss_update_active_sessions(ss, rec, locked_start, old_len, replacement_len, sentence_delta, session);
 
@@ -2138,7 +2258,7 @@ static void handle_client_checkpoint(StorageServer *ss, int fd, ProtocolMessage 
     safe_strcpy(slot->tag, tag_copy, sizeof(slot->tag));
     safe_strcpy(slot->filepath, ckpt_path, sizeof(slot->filepath));
 
-    ss_touch_file_metadata(rec, username, 0);
+    ss_touch_file_metadata(ss, rec, username, 0);
     pthread_mutex_unlock(&rec->file_lock);
 
     char message[256];
@@ -2235,7 +2355,7 @@ static void handle_client_viewcheckpoint(StorageServer *ss, int fd, ProtocolMess
         free(end_msg);
     }
 
-    ss_touch_file_metadata(rec, username, 0);
+    ss_touch_file_metadata(ss, rec, username, 0);
     pthread_mutex_unlock(&rec->file_lock);
     free(content);
 }
@@ -2314,7 +2434,7 @@ static void handle_client_revert(StorageServer *ss, int fd, ProtocolMessage *msg
     }
 
     rec->undo_available = 1;
-    ss_touch_file_metadata(rec, username, 1);
+    ss_touch_file_metadata(ss, rec, username, 1);
     pthread_mutex_unlock(&rec->file_lock);
 
     char message[256];
@@ -2371,7 +2491,7 @@ static void handle_client_listcheckpoints(StorageServer *ss, int fd, ProtocolMes
         free(end_msg);
     }
 
-    ss_touch_file_metadata(rec, username, 0);
+    ss_touch_file_metadata(ss, rec, username, 0);
     pthread_mutex_unlock(&rec->file_lock);
 }
 
@@ -2433,7 +2553,7 @@ static void handle_client_undo(StorageServer *ss, int fd, ProtocolMessage *msg) 
 
     free(undo_content);
     rec->undo_available = 0;
-    ss_touch_file_metadata(rec, username, 1);
+    ss_touch_file_metadata(ss, rec, username, 1);
 
     pthread_mutex_unlock(&rec->file_lock);
 

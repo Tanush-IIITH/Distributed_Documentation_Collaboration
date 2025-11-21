@@ -67,3 +67,6 @@ docs/.doctrees/
 # Backup files
 *.backup
 *-backup
+
+# Miscellaneous
+project_writeup.txt

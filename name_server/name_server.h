@@ -20,6 +20,7 @@ typedef struct {
     long long size;
     long long word_count;
     long long char_count;
+    int is_directory;
     time_t created;
     time_t modified;
     time_t last_access;

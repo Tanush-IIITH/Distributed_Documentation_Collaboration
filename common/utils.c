@@ -447,6 +447,36 @@ int validate_permission(const char *permission) {
     return strcmp(permission, "R") == 0 || strcmp(permission, "W") == 0;
 }
 
+int flatten_logical_path(const char *logical, char *physical, size_t size) {
+    if (!logical || !physical || size == 0) {
+        return -1;
+    }
+
+    size_t out_idx = 0;
+    for (const char *p = logical; *p; ++p) {
+        unsigned char ch = (unsigned char)*p;
+
+        if (ch == '/' ) {
+            ch = '_';
+        }
+
+        if (out_idx + 1 >= size) {
+            physical[0] = '\0';
+            return -1;
+        }
+
+        physical[out_idx++] = (char)ch;
+    }
+
+    if (out_idx >= size) {
+        physical[0] = '\0';
+        return -1;
+    }
+
+    physical[out_idx] = '\0';
+    return 0;
+}
+
 // ============================================================================
 // MEMORY UTILITIES
 // ============================================================================

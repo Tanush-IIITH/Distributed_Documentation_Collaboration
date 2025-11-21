@@ -21,6 +21,7 @@ typedef struct {
 
 typedef struct FileRecord {
     char filename[MAX_FILENAME_LENGTH];
+    char physical_name[MAX_FILENAME_LENGTH];
     char filepath[MAX_PATH_LENGTH];
     char metapath[MAX_PATH_LENGTH];
     char undopath[MAX_PATH_LENGTH];

@@ -111,6 +111,9 @@
 // NS -> SS: SS_REMACCESS|filename|username\n
 #define MSG_SS_REMACCESS "SS_REMACCESS"
 
+// NS -> SS: SS_RENAME|old_logical|new_logical|old_flat|new_flat\n
+#define MSG_SS_RENAME "SS_RENAME"
+
 // ============================================================================
 // MESSAGE TYPES - LOCATION REQUEST (C -> NS)
 // ============================================================================
@@ -221,6 +224,10 @@
 // Stream responses
 #define RESP_OK_STREAM "OK_STREAM"
 #define RESP_OK_STREAM_END "OK_STREAM_END"
+
+// Folder listings
+#define RESP_OK_VIEWFOLDER "OK_VIEWFOLDER"
+#define RESP_OK_VIEWFOLDER_END "OK_VIEWFOLDER_END"
 
 // Exec responses
 #define RESP_OK_EXEC_START "OK_EXEC_START"

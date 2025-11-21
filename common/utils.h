@@ -246,6 +246,13 @@ int validate_filename(const char *filename);
  */
 int validate_permission(const char *permission);
 
+/**
+ * Flatten a logical path (e.g. foo/bar.txt) into a filesystem-safe
+ * representation that avoids directory creation (e.g. foo_bar.txt).
+ * Returns 0 on success, -1 on error (including insufficient buffer space).
+ */
+int flatten_logical_path(const char *logical, char *physical, size_t size);
+
 // ============================================================================
 // MEMORY UTILITIES
 // ============================================================================

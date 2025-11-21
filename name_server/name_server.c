@@ -18,6 +18,17 @@ static void ns_load_metadata(NameServer *ns);
 static void ns_recalculate_server_load_locked(NameServer *ns, StorageServerInfo *ss);
 static StorageServerInfo *ns_select_storage_server_balanced(NameServer *ns);
 
+#define PATH_SEPARATOR '/'
+
+static int ns_validate_logical_path(const char *path);
+static int ns_split_parent_child(const char *path, char *parent, size_t parent_size,
+                                 char *child, size_t child_size);
+static int ns_is_descendant_path(const char *candidate, const char *ancestor);
+static int ns_normalize_destination(const char *input, char *normalized, size_t size);
+static int file_index_remove_entry(NameServer *ns, const char *filename);
+static void file_cache_invalidate(NameServer *ns, const char *filename);
+static void file_cache_rename(NameServer *ns, const char *old_name, const char *new_name, int array_index);
+
 // Initialize the Name Server
 int ns_init(NameServer *ns, int port) {
     if (!ns) {
@@ -35,7 +46,6 @@ int ns_init(NameServer *ns, int port) {
     memset(ns->file_index, 0, sizeof(ns->file_index));
     memset(ns->file_cache, 0, sizeof(ns->file_cache));
     ns->cache_tick = 0;
-    ns->ss_round_robin_index = 0;
     if (pthread_mutex_init(&ns->state_lock, NULL) != 0) {
         log_message(LOG_ERROR, "NS", "Failed to initialize mutex: %s", strerror(errno));
         return -1;
@@ -46,7 +56,6 @@ int ns_init(NameServer *ns, int port) {
     return 0;
 }
 
-// Connection context structure - to hold per-connection state
 typedef struct {
     NameServer *ns;
     int conn_fd; //connection file descriptor
@@ -217,6 +226,9 @@ static void ns_recalculate_server_load_locked(NameServer *ns, StorageServerInfo 
 
     for (int i = 0; i < ns->file_count; i++) {
         FileMetadata *meta = &ns->files[i];
+        if (meta->is_directory) {
+            continue;
+        }
         if (strncmp(meta->ss_ip, ss->client_ip, MAX_IP_LENGTH) == 0 && meta->ss_port == ss->client_port) {
             files++;
             if (meta->size > 0) {
@@ -264,6 +276,164 @@ static StorageServerInfo *ns_select_storage_server_balanced(NameServer *ns) {
     }
 
     return best;
+}
+
+static int ns_validate_logical_path(const char *path) {
+    if (!path || path[0] == '\0') {
+        return 0;
+    }
+
+    if (!validate_filename(path)) {
+        return 0;
+    }
+
+    size_t len = strlen(path);
+    if (path[0] == PATH_SEPARATOR || path[len - 1] == PATH_SEPARATOR) {
+        return 0;
+    }
+
+    if (strstr(path, "//")) {
+        return 0;
+    }
+
+    char buffer[MAX_FILENAME_LENGTH];
+    if (safe_strcpy(buffer, path, sizeof(buffer)) != 0) {
+        return 0;
+    }
+
+    char *saveptr = NULL;
+    char *segment = strtok_r(buffer, "/", &saveptr);
+    while (segment) {
+        if (segment[0] == '\0' || strcmp(segment, ".") == 0 || strcmp(segment, "..") == 0) {
+            return 0;
+        }
+        segment = strtok_r(NULL, "/", &saveptr);
+    }
+
+    return 1;
+}
+
+static int ns_split_parent_child(const char *path, char *parent, size_t parent_size,
+                                 char *child, size_t child_size) {
+    if (!path || !parent || !child) {
+        return -1;
+    }
+
+    const char *slash = strrchr(path, PATH_SEPARATOR);
+    if (!slash) {
+        if (safe_strcpy(parent, "", parent_size) != 0) {
+            return -1;
+        }
+        return safe_strcpy(child, path, child_size);
+    }
+
+    size_t parent_len = (size_t)(slash - path);
+    if (parent_len + 1 > parent_size) {
+        return -1;
+    }
+    memcpy(parent, path, parent_len);
+    parent[parent_len] = '\0';
+
+    return safe_strcpy(child, slash + 1, child_size);
+}
+
+static int ns_is_descendant_path(const char *candidate, const char *ancestor) {
+    if (!candidate || !ancestor) {
+        return 0;
+    }
+
+    if (ancestor[0] == '\0') {
+        return 1;
+    }
+
+    size_t prefix_len = strlen(ancestor);
+    if (strncmp(candidate, ancestor, prefix_len) != 0) {
+        return 0;
+    }
+
+    if (candidate[prefix_len] == '\0') {
+        return 1;
+    }
+
+    return candidate[prefix_len] == PATH_SEPARATOR;
+}
+
+static int ns_normalize_destination(const char *input, char *normalized, size_t size) {
+    if (!input || !normalized) {
+        return -1;
+    }
+
+    if (strcmp(input, ".") == 0 || strcmp(input, "/") == 0) {
+        if (size > 0) {
+            normalized[0] = '\0';
+            return 0;
+        }
+        return -1;
+    }
+
+    if (!ns_validate_logical_path(input)) {
+        return -1;
+    }
+
+    return safe_strcpy(normalized, input, size);
+}
+
+static int file_index_remove_entry(NameServer *ns, const char *filename) {
+    if (!ns || !filename) {
+        return 0;
+    }
+
+    unsigned long bucket = hash_filename(filename) % FILE_INDEX_SIZE;
+    FileIndexNode *prev = NULL;
+    FileIndexNode *node = ns->file_index[bucket];
+    while (node) {
+        if (strcmp(node->filename, filename) == 0) {
+            if (prev) {
+                prev->next = node->next;
+            } else {
+                ns->file_index[bucket] = node->next;
+            }
+            free(node);
+            return 1;
+        }
+        prev = node;
+        node = node->next;
+    }
+    return 0;
+}
+
+static void file_cache_invalidate(NameServer *ns, const char *filename) {
+    if (!ns || !filename) {
+        return;
+    }
+
+    for (int i = 0; i < FILE_CACHE_SIZE; i++) {
+        FileCacheEntry *entry = &ns->file_cache[i];
+        if (!entry->valid) {
+            continue;
+        }
+        if (strcmp(entry->filename, filename) == 0) {
+            entry->valid = 0;
+        }
+    }
+}
+
+static void file_cache_rename(NameServer *ns, const char *old_name, const char *new_name, int array_index) {
+    if (!ns || !old_name || !new_name) {
+        return;
+    }
+
+    for (int i = 0; i < FILE_CACHE_SIZE; i++) {
+        FileCacheEntry *entry = &ns->file_cache[i];
+        if (!entry->valid) {
+            continue;
+        }
+        if (strcmp(entry->filename, old_name) == 0) {
+            safe_strcpy(entry->filename, new_name, sizeof(entry->filename));
+            entry->file_array_index = array_index;
+            entry->last_used = ++ns->cache_tick;
+        }
+    }
 }
 
 // send a request to the storage server and block until the paired response arrives
@@ -732,17 +902,18 @@ static void ns_save_metadata(NameServer *ns) {
     fprintf(fp, "%d\n", ns->file_count);
     for (int i = 0; i < ns->file_count; i++) {
         FileMetadata *f = &ns->files[i];
-        fprintf(fp, "FILE|%s|%s|%s|%d|%lld|%lld|%lld|%lld|%lld|%lld\n",
+        fprintf(fp, "FILE|%s|%s|%s|%d|%lld|%lld|%lld|%lld|%lld|%lld|%d\n",
                 f->filename,
                 f->owner,
                 f->ss_ip,
                 f->ss_port,
                 f->size,
-            f->word_count,
-            f->char_count,
-            (long long)f->created,
-            (long long)f->modified,
-            (long long)f->last_access);
+                f->word_count,
+                f->char_count,
+                (long long)f->created,
+                (long long)f->modified,
+                (long long)f->last_access,
+                f->is_directory ? 1 : 0);
 
         fprintf(fp, "READ|");
         for (int j = 0; j < f->read_access_count; j++) {
@@ -796,9 +967,9 @@ static void ns_load_metadata(NameServer *ns) {
         if (strncmp(line, "FILE|", 5) == 0) {
             char *payload = line + 5;
             char *saveptr = NULL;
-            char *parts[10] = {0};
+            char *parts[11] = {0};
             int token_count = 0;
-            for (int idx = 0; idx < 10; idx++) {
+            for (int idx = 0; idx < 11; idx++) {
                 parts[idx] = (idx == 0) ? strtok_r(payload, "|", &saveptr)
                                         : strtok_r(NULL, "|", &saveptr);
                 if (!parts[idx]) {
@@ -830,7 +1001,7 @@ static void ns_load_metadata(NameServer *ns) {
                 file->size = atoll(parts[4]);
             }
 
-            if (token_count >= 10) {
+            if (token_count >= 11) {
                 if (parts[5]) {
                     file->word_count = atoll(parts[5]);
                 }
@@ -846,6 +1017,9 @@ static void ns_load_metadata(NameServer *ns) {
                 if (parts[9]) {
                     file->last_access = (time_t)atoll(parts[9]);
                 }
+                if (parts[10]) {
+                    file->is_directory = atoi(parts[10]) ? 1 : 0;
+                }
             } else {
                 // Legacy metadata (without counts) -> set counters to zero
                 if (parts[5]) {
@@ -857,6 +1031,7 @@ static void ns_load_metadata(NameServer *ns) {
                 if (parts[7]) {
                     file->last_access = (time_t)atoll(parts[7]);
                 }
+                file->is_directory = 0;
             }
 
             file_index_insert(ns, file->filename, ns->file_count);
