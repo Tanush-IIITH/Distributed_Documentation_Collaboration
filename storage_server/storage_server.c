@@ -655,15 +655,6 @@ static int ss_emit_file_list(StorageServer *ss) {
         snprintf(word_buf, sizeof(word_buf), "%d", words);
         snprintf(char_buf, sizeof(char_buf), "%d", chars);
 
-        char created_buf[32];
-        char mod_buf[32];
-        char access_buf[32];
-        snprintf(created_buf, sizeof(created_buf), "%lld", (long long)node->created);
-        snprintf(mod_buf, sizeof(mod_buf), "%lld", (long long)node->modified);
-        snprintf(access_buf, sizeof(access_buf), "%lld", (long long)node->last_access);
-
-        const char *last_user = node->last_access_user[0] ? node->last_access_user : "";
-
         if (ss_join_acl((const char (*)[MAX_USERNAME_LENGTH])node->read_users, node->read_count, read_acl_buf, sizeof(read_acl_buf)) != 0) {
             log_message(LOG_ERROR, "SS", "Failed to serialize read ACL for %s", node->filename);
             read_acl_buf[0] = '\0';
@@ -681,12 +672,8 @@ static int ss_emit_file_list(StorageServer *ss) {
             write_acl_buf,
             size_buf,
             word_buf,
-            char_buf,
-            created_buf,
-            mod_buf,
-            access_buf,
-            last_user};
-        char *msg = protocol_build_message(fields, 12);
+            char_buf};
+        char *msg = protocol_build_message(fields, 8);
         if (!msg) {
             pthread_mutex_unlock(&ss->files_lock);
             return -1;
