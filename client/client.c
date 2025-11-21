@@ -30,6 +30,9 @@ static int client_handle_requestaccess(Client *client, const char *filename, con
 static int client_handle_listrequests(Client *client);
 static int client_handle_approveaccess(Client *client, int request_id);
 static int client_handle_rejectaccess(Client *client, int request_id);
+static int client_handle_createfolder(Client *client, const char *path);
+static int client_handle_viewfolder(Client *client, const char *path);
+static int client_handle_move(Client *client, const char *source, const char *destination);
 static int client_request_location(Client *client, const char *operation, const char *filename,
                                    char *out_ip, size_t ip_len, int *out_port,
                                    char *out_filename, size_t filename_len);
@@ -296,11 +299,27 @@ int client_process_command(Client *client, const char *input) {
         }
         return client_handle_exec(client, filename);
     } else if (strcasecmp(command, "CREATEFOLDER") == 0) {
-        // TODO: handle CREATEFOLDER <foldername>
+        char path[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", path) != 1) {
+            printf("Usage: CREATEFOLDER <path>\n");
+            return -1;
+        }
+        return client_handle_createfolder(client, path);
     } else if (strcasecmp(command, "MOVE") == 0) {
-        // TODO: handle MOVE <filename> <foldername>
+        char source[MAX_FILENAME_LENGTH];
+        char destination[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s %511s", source, destination) != 2) {
+            printf("Usage: MOVE <source_path> <destination_folder>\n");
+            return -1;
+        }
+        return client_handle_move(client, source, destination);
     } else if (strcasecmp(command, "VIEWFOLDER") == 0) {
-        // TODO: handle VIEWFOLDER <foldername>
+        char path[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s", path) != 1) {
+            printf("Usage: VIEWFOLDER <path>\n");
+            return -1;
+        }
+        return client_handle_viewfolder(client, path);
     } else if (strcasecmp(command, "CHECKPOINT") == 0) {
         char filename[MAX_FILENAME_LENGTH], tag[MAX_TAG_LENGTH];
         if (sscanf(input, "%*s %511s %127s", filename, tag) != 2) {
@@ -894,6 +913,136 @@ static int client_handle_delete(Client *client, const char *filename) {
     free(raw);
 
     return is_error ? -1 : 0;
+}
+
+static int client_handle_createfolder(Client *client, const char *path) {
+    if (!client || client->ns_sockfd < 0 || !path) {
+        return -1;
+    }
+
+    if (path[0] == '\0') {
+        printf("Folder path cannot be empty.\n");
+        return -1;
+    }
+
+    const char *fields[] = {MSG_CREATEFOLDER, path};
+    char *message = protocol_build_message(fields, 2);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send CREATEFOLDER command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for CREATEFOLDER\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    int is_error = protocol_is_error(&resp);
+    protocol_free_message(&resp);
+    free(raw);
+    return is_error ? -1 : 0;
+}
+
+static int client_handle_move(Client *client, const char *source, const char *destination) {
+    if (!client || client->ns_sockfd < 0 || !source || !destination) {
+        return -1;
+    }
+
+    if (source[0] == '\0' || destination[0] == '\0') {
+        printf("Source and destination paths cannot be empty.\n");
+        return -1;
+    }
+
+    const char *fields[] = {MSG_MOVE, source, destination};
+    char *message = protocol_build_message(fields, 3);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send MOVE command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for MOVE\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    int is_error = protocol_is_error(&resp);
+    protocol_free_message(&resp);
+    free(raw);
+    return is_error ? -1 : 0;
+}
+
+static int client_handle_viewfolder(Client *client, const char *path) {
+    if (!client || client->ns_sockfd < 0 || !path) {
+        return -1;
+    }
+
+    if (path[0] == '\0') {
+        printf("Folder path cannot be empty.\n");
+        return -1;
+    }
+
+    const char *fields[] = {MSG_VIEWFOLDER, path};
+    char *message = protocol_build_message(fields, 2);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send VIEWFOLDER command\n");
+        return -1;
+    }
+
+    int printed_any = 0;
+    while (1) {
+        ProtocolMessage resp;
+        char *raw = NULL;
+        if (client_read_response(client, &resp, &raw) != 0) {
+            printf("Connection lost while viewing folder\n");
+            return -1;
+        }
+
+        int done = 0;
+        if (resp.field_count > 0) {
+            if (strcmp(resp.fields[0], RESP_OK_VIEWFOLDER_END) == 0) {
+                done = 1;
+            } else if (strcmp(resp.fields[0], RESP_OK_VIEWFOLDER) == 0 && resp.field_count >= 2) {
+                printed_any = 1;
+                printf(" - %s\n", resp.fields[1]);
+            } else if (protocol_is_error(&resp)) {
+                client_print_ns_response(&resp);
+                protocol_free_message(&resp);
+                free(raw);
+                return -1;
+            }
+        }
+
+        protocol_free_message(&resp);
+        free(raw);
+
+        if (done) {
+            break;
+        }
+    }
+
+    if (!printed_any) {
+        printf("(Folder is empty)\n");
+    }
+
+    return 0;
 }
 
 static int client_handle_copy(Client *client, const char *src, const char *dest) {

@@ -75,6 +75,8 @@ typedef struct {
     unsigned long last_used;
 } FileCacheEntry;
 
+
+
 #define FILE_CACHE_SIZE 64
 
 typedef struct {
@@ -112,6 +114,16 @@ typedef struct {
     unsigned long cache_tick; // Monotonic counter for cache usage tracking
     int ss_round_robin_index; // Index of the next storage server to use for balancing
 } NameServer;
+
+
+typedef struct {
+    char old_path[MAX_FILENAME_LENGTH];
+    char new_path[MAX_FILENAME_LENGTH];
+    int is_directory;
+    StorageServerInfo *ss;
+    char old_flat[MAX_FILENAME_LENGTH];
+    char new_flat[MAX_FILENAME_LENGTH];
+} MovePlanEntry;
 
 /**
  * Initialize the Name Server

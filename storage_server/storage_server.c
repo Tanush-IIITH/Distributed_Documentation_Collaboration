@@ -2131,7 +2131,7 @@ static void handle_ss_copy(StorageServer *ss, ProtocolMessage *msg) {
         return;
     }
 
-    ss_touch_file_metadata(dest_rec, username, 1);
+    ss_touch_file_metadata(ss, dest_rec, username, 1);
     ss_sync_metadata_to_ns(ss, dest_rec);
     pthread_mutex_unlock(&dest_rec->file_lock);
     send_simple_ok(ss->ns_sockfd, "Copy successful");
@@ -2965,7 +2965,15 @@ int ss_start(StorageServer *ss) {
     }
 
     log_message(LOG_INFO, "SS", "Storage server started on %s:%d", ss->client_ip, ss->client_port);
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        log_message(LOG_ERROR, "NS", "Failed to init thread attributes: %s", strerror(errno));
+    }
 
+    size_t stack_size = 4 * 1024 * 1024; 
+    if (pthread_attr_setstacksize(&attr, stack_size) != 0) {
+        log_message(LOG_ERROR, "NS", "Failed to set stack size: %s", strerror(errno));
+    }
     while (ss->running) {
         struct sockaddr_in client_addr;
         socklen_t len = sizeof(client_addr);

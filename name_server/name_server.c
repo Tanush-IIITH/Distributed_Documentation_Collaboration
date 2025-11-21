@@ -1969,7 +1969,6 @@ static void run_client_loop(ConnectionContext *ctx) {
                                 if (src_idx >= 0 && src_idx < ns->file_count) {
                                     FileMetadata *tracked = &ns->files[src_idx];
                                     tracked->last_access = get_current_time();
-                                    safe_strcpy(tracked->last_access_user, ctx->username, sizeof(tracked->last_access_user));
                                     persist_metadata = 1;
                                 }
                                 ns_release_state_lock(ns, &state_locked);
@@ -1988,7 +1987,6 @@ static void run_client_loop(ConnectionContext *ctx) {
             }
         } else if (strcmp(command, MSG_CREATE) == 0) {
             // Handle the CREATE command: validate input, update metadata, and coordinate with storage servers
-
             if (cmd_msg.field_count < 2) {
                 // Check if the filename is provided in the command
                 send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in CREATE.", ctx->peer_ip, ctx->peer_port);
@@ -2174,147 +2172,791 @@ static void run_client_loop(ConnectionContext *ctx) {
                     }
                 }
             }
-        } else if (strcmp(command, MSG_DELETE) == 0) {
+        } else if (strcmp(command, MSG_CREATEFOLDER) == 0) {
             if (cmd_msg.field_count < 2) {
-                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Filename missing in DELETE.", ctx->peer_ip, ctx->peer_port);
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Usage: CREATEFOLDER <path>", ctx->peer_ip, ctx->peer_port);
             } else {
-                const char *filename = cmd_msg.fields[1];
-
-                if (!validate_filename(filename)) {
-                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename requested for DELETE.", ctx->peer_ip, ctx->peer_port);
+                const char *path = cmd_msg.fields[1];
+                if (!ns_validate_logical_path(path)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid path format.", ctx->peer_ip, ctx->peer_port);
                 } else if (ctx->username[0] == '\0') {
                     send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
                 } else {
-                    StorageServerInfo *target_ss = NULL;
-                    int target_ss_acquired = 0;
-                    char *ss_resp_raw = NULL;
-                    ProtocolMessage ss_resp_msg;
-                    int ss_resp_parsed = 0;
+                    int state_locked = 0;
                     int persist_metadata = 0;
+                    printf("ppap\n");
+                    int error_code = 0;
+                    char error_detail[MAX_FIELD_SIZE];
+                    error_detail[0] = '\0';
 
                     pthread_mutex_lock(&ns->state_lock);
-                    int file_slot = -1;
-                    FileMetadata *file = file_lookup_locked(ns, filename, &file_slot);
-                    if (!file) {
+                    state_locked = 1;
+                    do {
+                        if (ns->file_count >= NS_MAX_FILES) {
+                            error_code = ERR_INTERNAL_ERROR;
+                            safe_strcpy(error_detail, "Maximum file limit reached.", sizeof(error_detail));
+                            break;
+                        }
+
+                        int existing_index = -1;
+                        if (file_lookup_locked(ns, path, &existing_index) != NULL) {
+                            error_code = ERR_FILE_EXISTS;
+                            safe_strcpy(error_detail, "Path already exists.", sizeof(error_detail));
+                            break;
+                        }
+
+                        char parent_path[MAX_FILENAME_LENGTH];
+                        char child_name[MAX_FILENAME_LENGTH];
+                        if (ns_split_parent_child(path, parent_path, sizeof(parent_path), child_name, sizeof(child_name)) != 0) {
+                            error_code = ERR_INVALID_REQUEST;
+                            safe_strcpy(error_detail, "Unable to resolve parent folder.", sizeof(error_detail));
+                            break;
+                        }
+
+                        if (parent_path[0] != '\0') {
+                            FileMetadata *parent_meta = file_lookup_locked(ns, parent_path, NULL);
+                            if (!parent_meta) {
+                                error_code = ERR_FILE_NOT_FOUND;
+                                safe_strcpy(error_detail, "Parent folder does not exist.", sizeof(error_detail));
+                                break;
+                            }
+                            if (!parent_meta->is_directory) {
+                                error_code = ERR_INVALID_REQUEST;
+                                safe_strcpy(error_detail, "Parent path is not a folder.", sizeof(error_detail));
+                                break;
+                            }
+                        }
+
+                        int new_index = ns->file_count;
+                        if (new_index >= NS_MAX_FILES) {
+                            error_code = ERR_INTERNAL_ERROR;
+                            safe_strcpy(error_detail, "Maximum file limit reached.", sizeof(error_detail));
+                            break;
+                        }
+
+                        FileMetadata *meta = &ns->files[new_index];
+                        memset(meta, 0, sizeof(FileMetadata));
+
+                        if (safe_strcpy(meta->filename, path, sizeof(meta->filename)) != 0 ||
+                            safe_strcpy(meta->owner, ctx->username, sizeof(meta->owner)) != 0) {
+                            memset(meta, 0, sizeof(FileMetadata));
+                            error_code = ERR_INTERNAL_ERROR;
+                            safe_strcpy(error_detail, "Failed to record folder metadata.", sizeof(error_detail));
+                            break;
+                        }
+
+                        meta->is_directory = 1;
+                        meta->size = 0;
+                        meta->word_count = 0;
+                        meta->char_count = 0;
+                        time_t now = get_current_time();
+                        meta->created = now;
+                        meta->modified = now;
+                        meta->last_access = now;
+
+                        if (file_index_insert(ns, path, new_index) != 0) {
+                            memset(meta, 0, sizeof(FileMetadata));
+                            error_code = ERR_INTERNAL_ERROR;
+                            safe_strcpy(error_detail, "Failed to index folder metadata.", sizeof(error_detail));
+                            break;
+                        }
+
+                        ns->file_count++;
+                        file_cache_store(ns, path, new_index);
+                        persist_metadata = 1;
+                    } while (0);
+
+                    if (state_locked) {
                         pthread_mutex_unlock(&ns->state_lock);
-                        send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "File not found for DELETE.", ctx->peer_ip, ctx->peer_port);
+                    }
+
+                    if (persist_metadata) {
+                        send_simple_ok(ctx->conn_fd, "Folder created.");
+                        log_message(LOG_INFO, "NS", "Folder '%s' created by %s", path, ctx->username);
+                        ns_save_metadata(ns);
                     } else {
-                        if (strncmp(file->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
-                            pthread_mutex_unlock(&ns->state_lock);
-                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "Only the owner may delete the file.", ctx->peer_ip, ctx->peer_port);
-                        } else {
-                            for (int i = 0; i < ns->ss_count; i++) {
-                                StorageServerInfo *candidate = ns->storage_servers[i];
-                                if (!candidate || !candidate->is_alive) {
+                        const char *detail = (error_detail[0] != '\0') ? error_detail : "Unable to create folder.";
+                        send_error_and_log(ctx->conn_fd, (error_code != 0) ? error_code : ERR_INTERNAL_ERROR, detail,
+                                          ctx->peer_ip, ctx->peer_port);
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_VIEWFOLDER) == 0) {
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Usage: VIEWFOLDER <path>", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *input_path = cmd_msg.fields[1];
+                char normalized[MAX_FILENAME_LENGTH];
+                if (ns_normalize_destination(input_path, normalized, sizeof(normalized)) != 0) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid folder path.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    int is_root = (normalized[0] == '\0');
+                    size_t folder_len = strlen(normalized);
+                    int error_code = 0;
+                    const char *detail = NULL;
+
+                    pthread_mutex_lock(&ns->state_lock);
+
+                    FileMetadata *folder_meta = NULL;
+                    if (!is_root) {
+                        folder_meta = file_lookup_locked(ns, normalized, NULL);
+                        if (!folder_meta) {
+                            error_code = ERR_FILE_NOT_FOUND;
+                            detail = "Folder not found.";
+                        } else if (!folder_meta->is_directory) {
+                            error_code = ERR_INVALID_REQUEST;
+                            detail = "Requested path is not a folder.";
+                        }
+                    }
+
+                    if (error_code != 0) {
+                        pthread_mutex_unlock(&ns->state_lock);
+                        send_error_and_log(ctx->conn_fd, error_code, detail ? detail : "Unable to list folder.",
+                                          ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        for (int i = 0; i < ns->file_count; i++) {
+                            FileMetadata *fm = &ns->files[i];
+
+                            if (is_root) {
+                                if (strchr(fm->filename, PATH_SEPARATOR)) {
                                     continue;
                                 }
-                                if (strncmp(candidate->client_ip, file->ss_ip, MAX_IP_LENGTH) == 0 && candidate->client_port == file->ss_port) {
-                                    target_ss = candidate;
+                            } else {
+                                if (strcmp(fm->filename, normalized) == 0) {
+                                    continue;
+                                }
+                                if (strncmp(fm->filename, normalized, folder_len) != 0) {
+                                    continue;
+                                }
+                                if (fm->filename[folder_len] != PATH_SEPARATOR) {
+                                    continue;
+                                }
+                                const char *remainder = fm->filename + folder_len + 1;
+                                if (!remainder[0]) {
+                                    continue;
+                                }
+                                if (strchr(remainder, PATH_SEPARATOR)) {
+                                    continue;
+                                }
+                            }
+
+                            const char *fields[] = {RESP_OK_VIEWFOLDER, fm->filename};
+                            char *resp = protocol_build_message(fields, 2);
+                            if (resp) {
+                                protocol_send_message(ctx->conn_fd, resp);
+                                free(resp);
+                            }
+                        }
+
+                        pthread_mutex_unlock(&ns->state_lock);
+
+                        const char *end_fields[] = {RESP_OK_VIEWFOLDER_END};
+                        char *end_msg = protocol_build_message(end_fields, 1);
+                        if (end_msg) {
+                            protocol_send_message(ctx->conn_fd, end_msg);
+                            free(end_msg);
+                        } else {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to finish folder listing.",
+                                              ctx->peer_ip, ctx->peer_port);
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_MOVE) == 0) {
+            if (cmd_msg.field_count < 3) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Usage: MOVE <source> <destination_folder>", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *src_path = cmd_msg.fields[1];
+                const char *dest_folder_arg = cmd_msg.fields[2];
+                if (!ns_validate_logical_path(src_path)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid source path.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    char normalized_dest[MAX_FILENAME_LENGTH];
+                    if (ns_normalize_destination(dest_folder_arg, normalized_dest, sizeof(normalized_dest)) != 0) {
+                        send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid destination folder.", ctx->peer_ip, ctx->peer_port);
+                    } else {
+
+                        MovePlanEntry *plan = NULL;
+                        int plan_count = 0;
+                        StorageServerInfo **acquired_refs = NULL;
+                        int acquired_count = 0;
+                        int *rename_success_indices = NULL;
+                        int rename_success_count = 0;
+                        int error_code = 0;
+                        char error_detail[MAX_FIELD_SIZE];
+                        error_detail[0] = '\0';
+                        char final_root_path[MAX_FILENAME_LENGTH];
+                        final_root_path[0] = '\0';
+                        int dest_is_root = (normalized_dest[0] == '\0');
+
+                        pthread_mutex_lock(&ns->state_lock);
+
+                        int capacity = ns->file_count > 0 ? ns->file_count : 1;
+                        plan = safe_calloc((size_t)capacity, sizeof(MovePlanEntry));
+                        acquired_refs = safe_calloc((size_t)capacity, sizeof(StorageServerInfo *));
+                        rename_success_indices = safe_calloc((size_t)capacity, sizeof(int));
+                        if (!plan || !acquired_refs || !rename_success_indices) {
+                            error_code = ERR_INTERNAL_ERROR;
+                            safe_strcpy(error_detail, "Unable to allocate move plan.", sizeof(error_detail));
+                        }
+
+                        do {
+                            if (error_code != 0) {
+                                break;
+                            }
+                            int src_index = -1;
+                            FileMetadata *src_meta = file_lookup_locked(ns, src_path, &src_index);
+                            if (!src_meta) {
+                                error_code = ERR_FILE_NOT_FOUND;
+                                safe_strcpy(error_detail, "Source path not found.", sizeof(error_detail));
+                                break;
+                            }
+
+                            if (strncmp(src_meta->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                                error_code = ERR_PERMISSION_DENIED;
+                                safe_strcpy(error_detail, "Only the owner may move this entry.", sizeof(error_detail));
+                                break;
+                            }
+
+                            FileMetadata *dest_meta = NULL;
+                            if (!dest_is_root) {
+                                dest_meta = file_lookup_locked(ns, normalized_dest, NULL);
+                                if (!dest_meta) {
+                                    error_code = ERR_FILE_NOT_FOUND;
+                                    safe_strcpy(error_detail, "Destination folder not found.", sizeof(error_detail));
+                                    break;
+                                }
+                                if (!dest_meta->is_directory) {
+                                    error_code = ERR_INVALID_REQUEST;
+                                    safe_strcpy(error_detail, "Destination is not a folder.", sizeof(error_detail));
                                     break;
                                 }
                             }
 
-                            if (!target_ss || target_ss->sockfd < 0 || !target_ss->is_alive) {
-                                pthread_mutex_unlock(&ns->state_lock);
-                                send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Storage server unavailable for DELETE.", ctx->peer_ip, ctx->peer_port);
+                            char parent_path[MAX_FILENAME_LENGTH];
+                            char base_name[MAX_FILENAME_LENGTH];
+                            if (ns_split_parent_child(src_path, parent_path, sizeof(parent_path), base_name, sizeof(base_name)) != 0) {
+                                error_code = ERR_INVALID_REQUEST;
+                                safe_strcpy(error_detail, "Unable to resolve source path.", sizeof(error_detail));
+                                break;
+                            }
+
+                            if (dest_is_root) {
+                                if (safe_strcpy(final_root_path, base_name, sizeof(final_root_path)) != 0) {
+                                    error_code = ERR_INTERNAL_ERROR;
+                                    safe_strcpy(error_detail, "Destination path too long.", sizeof(error_detail));
+                                    break;
+                                }
                             } else {
-                                storage_server_acquire(target_ss);
-                                target_ss_acquired = 1;
-                                pthread_mutex_unlock(&ns->state_lock);
-
-                                const char *fields[] = {MSG_DELETE_FILE, filename};
-                                int ss_status = storage_server_send_and_wait(target_ss, fields, 2, &ss_resp_raw);
-                                if (ss_status != 0) {
-                                    const char *detail = "Storage server communication failure.";
-                                    if (ss_status == -2) {
-                                        detail = "Storage server unavailable.";
-                                    } else if (ss_status == -3) {
-                                        detail = "Failed to encode storage server command.";
-                                    } else if (ss_status == -4) {
-                                        detail = "Failed to send command to storage server.";
-                                    } else if (ss_status == -5) {
-                                        detail = "Storage server disconnected.";
-                                    } else if (ss_status == -6) {
-                                        detail = "Incomplete response from storage server.";
-                                    }
-                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, detail, ctx->peer_ip, ctx->peer_port);
-                                } else if (protocol_parse_message(ss_resp_raw, &ss_resp_msg) != 0 || ss_resp_msg.field_count == 0) {
-                                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to parse SS response.", ctx->peer_ip, ctx->peer_port);
-                                } else {
-                                    ss_resp_parsed = 1;
-                                    if (protocol_is_error(&ss_resp_msg)) {
-                                        int err_code = protocol_get_error_code(&ss_resp_msg);
-                                        const char *detail = (ss_resp_msg.field_count >= 3) ? ss_resp_msg.fields[2] : "Storage server error.";
-                                        send_error_and_log(ctx->conn_fd, err_code, detail, ctx->peer_ip, ctx->peer_port);
-                                    } else if (strcmp(ss_resp_msg.fields[0], RESP_OK_DELETE) != 0) {
-                                        send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Unexpected SS response.", ctx->peer_ip, ctx->peer_port);
-                                    } else {
-                                        pthread_mutex_lock(&ns->state_lock);
-                                        long long removed_size = 0;
-                                        int belongs_to_target = 0;
-                                        int temp_index = -1;
-                                        FileMetadata *current_meta = file_lookup_locked(ns, filename, &temp_index);
-                                        if (current_meta) {
-                                            removed_size = current_meta->size;
-                                            if (strncmp(current_meta->ss_ip, target_ss->client_ip, MAX_IP_LENGTH) == 0 &&
-                                                current_meta->ss_port == target_ss->client_port) {
-                                                belongs_to_target = 1;
-                                            }
-                                        }
-
-                                        if (!remove_file_metadata_locked(ns, filename)) {
-                                            pthread_mutex_unlock(&ns->state_lock);
-                                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to retire file metadata.", ctx->peer_ip, ctx->peer_port);
-                                        } else {
-                                            if (belongs_to_target) {
-                                                if (target_ss->total_files > 0) {
-                                                    target_ss->total_files--;
-                                                }
-                                                if (removed_size > 0) {
-                                                    if (target_ss->total_bytes >= removed_size) {
-                                                        target_ss->total_bytes -= removed_size;
-                                                    } else {
-                                                        target_ss->total_bytes = 0;
-                                                    }
-                                                }
-                                            }
-                                            for (int i = 0; i < ns->request_count; i++) {
-                                                AccessRequest *req = &ns->access_requests[i];
-                                                if (req->is_pending && strcmp(req->filename, filename) == 0) {
-                                                    req->is_pending = 0;
-                                                    log_message(LOG_INFO, "NS", "Auto-cancelled request #%d for deleted file '%s'", req->id, filename);
-                                                }
-                                            }
-
-                                            pthread_mutex_unlock(&ns->state_lock);
-                                            char detail_buf[MAX_FIELD_SIZE];
-                                            snprintf(detail_buf, sizeof(detail_buf), "File '%s' deleted successfully.", filename);
-                                            send_simple_ok(ctx->conn_fd, detail_buf);
-                                            log_message(LOG_INFO, "NS", "File '%s' deleted by %s via SS %s:%d.", filename, ctx->username, target_ss->client_ip, target_ss->client_port);
-                                            persist_metadata = 1;
-                                        }
-                                    }
-                                }
-
-                                if (ss_resp_parsed) {
-                                    protocol_free_message(&ss_resp_msg);
-                                    ss_resp_parsed = 0;
-                                }
-                                if (ss_resp_raw) {
-                                    free(ss_resp_raw);
-                                    ss_resp_raw = NULL;
-                                }
-                                if (target_ss_acquired) {
-                                    storage_server_release(target_ss);
-                                    target_ss_acquired = 0;
-                                }
-
-                                if (persist_metadata) {
-                                    ns_save_metadata(ns);
+                                if (snprintf(final_root_path, sizeof(final_root_path), "%s/%s", normalized_dest, base_name) >= (int)sizeof(final_root_path)) {
+                                    error_code = ERR_INVALID_REQUEST;
+                                    safe_strcpy(error_detail, "Destination path too long.", sizeof(error_detail));
+                                    break;
                                 }
                             }
+
+                            if (strcmp(final_root_path, src_path) == 0) {
+                                error_code = ERR_INVALID_REQUEST;
+                                safe_strcpy(error_detail, "Source and destination are identical.", sizeof(error_detail));
+                                break;
+                            }
+
+                            if (src_meta->is_directory && !dest_is_root && ns_is_descendant_path(normalized_dest, src_path)) {
+                                error_code = ERR_INVALID_REQUEST;
+                                safe_strcpy(error_detail, "Cannot move a folder into its descendant.", sizeof(error_detail));
+                                break;
+                            }
+
+                            size_t src_len = strlen(src_path);
+                            for (int i = 0; i < ns->file_count; i++) {
+                                FileMetadata *fm = &ns->files[i];
+                                int is_target = (strcmp(fm->filename, src_path) == 0);
+                                int is_child = 0;
+
+                                if (src_meta->is_directory && !is_target) {
+                                    if (strncmp(fm->filename, src_path, src_len) == 0 && fm->filename[src_len] == PATH_SEPARATOR) {
+                                        is_child = 1;
+                                    }
+                                }
+
+                                if (!is_target && !is_child) {
+                                    continue;
+                                }
+
+                                if (strncmp(fm->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                                    error_code = ERR_PERMISSION_DENIED;
+                                    safe_strcpy(error_detail, "Move requires ownership of all contained entries.", sizeof(error_detail));
+                                    break;
+                                }
+
+                                MovePlanEntry entry;
+                                memset(&entry, 0, sizeof(entry));
+
+                                if (safe_strcpy(entry.old_path, fm->filename, sizeof(entry.old_path)) != 0) {
+                                    error_code = ERR_INTERNAL_ERROR;
+                                    safe_strcpy(error_detail, "Failed to record source path.", sizeof(error_detail));
+                                    break;
+                                }
+
+                                if (is_target) {
+                                    if (safe_strcpy(entry.new_path, final_root_path, sizeof(entry.new_path)) != 0) {
+                                        error_code = ERR_INTERNAL_ERROR;
+                                        safe_strcpy(error_detail, "Failed to record destination path.", sizeof(error_detail));
+                                        break;
+                                    }
+                                } else {
+                                    if (snprintf(entry.new_path, sizeof(entry.new_path), "%s%s", final_root_path, fm->filename + src_len) >= (int)sizeof(entry.new_path)) {
+                                        error_code = ERR_INVALID_REQUEST;
+                                        safe_strcpy(error_detail, "Destination path too long.", sizeof(error_detail));
+                                        break;
+                                    }
+                                }
+
+                                if (!ns_validate_logical_path(entry.new_path)) {
+                                    error_code = ERR_INVALID_REQUEST;
+                                    safe_strcpy(error_detail, "Destination path is invalid.", sizeof(error_detail));
+                                    break;
+                                }
+
+                                FileMetadata *collision = file_lookup_locked(ns, entry.new_path, NULL);
+                                if (collision && strcmp(collision->filename, entry.old_path) != 0) {
+                                    error_code = ERR_FILE_EXISTS;
+                                    safe_strcpy(error_detail, "Destination already contains an entry with that name.", sizeof(error_detail));
+                                    break;
+                                }
+
+                                entry.is_directory = fm->is_directory;
+
+                                if (!entry.is_directory) {
+                                    StorageServerInfo *ss = NULL;
+                                    for (int s = 0; s < ns->ss_count; s++) {
+                                        StorageServerInfo *candidate = ns->storage_servers[s];
+                                        if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
+                                            continue;
+                                        }
+                                        if (strncmp(candidate->client_ip, fm->ss_ip, MAX_IP_LENGTH) == 0 &&
+                                            candidate->client_port == fm->ss_port) {
+                                            ss = candidate;
+                                            break;
+                                        }
+                                    }
+
+                                    if (!ss) {
+                                        error_code = ERR_INTERNAL_ERROR;
+                                        safe_strcpy(error_detail, "Storage server unavailable for move.", sizeof(error_detail));
+                                        break;
+                                    }
+
+                                    if (flatten_logical_path(entry.old_path, entry.old_flat, sizeof(entry.old_flat)) != 0 ||
+                                        flatten_logical_path(entry.new_path, entry.new_flat, sizeof(entry.new_flat)) != 0) {
+                                        error_code = ERR_INTERNAL_ERROR;
+                                        safe_strcpy(error_detail, "Failed to derive storage filenames.", sizeof(error_detail));
+                                        break;
+                                    }
+
+                                    storage_server_acquire(ss);
+                                    entry.ss = ss;
+                                    acquired_refs[acquired_count++] = ss;
+                                } else {
+                                    entry.ss = NULL;
+                                }
+
+                                plan[plan_count++] = entry;
+                            }
+
+                            if (error_code != 0) {
+                                break;
+                            }
+
+                            if (plan_count == 0) {
+                                error_code = ERR_INTERNAL_ERROR;
+                                safe_strcpy(error_detail, "Move plan was empty.", sizeof(error_detail));
+                            }
+                        } while (0);
+
+                        if (error_code != 0) {
+                            for (int i = 0; i < acquired_count; i++) {
+                                storage_server_release(acquired_refs[i]);
+                            }
+                            pthread_mutex_unlock(&ns->state_lock);
+                            const char *detail = (error_detail[0] != '\0') ? error_detail : "Move failed.";
+                            send_error_and_log(ctx->conn_fd, error_code, detail, ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            for (int i = 0; i < plan_count; i++) {
+                                MovePlanEntry *entry = &plan[i];
+                                if (entry->is_directory) {
+                                    continue;
+                                }
+
+                                char *ss_resp_raw = NULL;
+                                const char *fields[] = {MSG_SS_RENAME, entry->old_path, entry->new_path, entry->old_flat, entry->new_flat};
+                                int ss_status = storage_server_send_and_wait(entry->ss, fields, 5, &ss_resp_raw);
+                                if (ss_status != 0) {
+                                    error_code = ERR_INTERNAL_ERROR;
+                                    safe_strcpy(error_detail, "Storage server rename failed.", sizeof(error_detail));
+                                } else if (!ss_resp_raw) {
+                                    error_code = ERR_INTERNAL_ERROR;
+                                    safe_strcpy(error_detail, "Missing storage server response.", sizeof(error_detail));
+                                } else {
+                                    ProtocolMessage ss_msg;
+                                    if (protocol_parse_message(ss_resp_raw, &ss_msg) != 0 || ss_msg.field_count == 0) {
+                                        error_code = ERR_INTERNAL_ERROR;
+                                        safe_strcpy(error_detail, "Malformed storage server response.", sizeof(error_detail));
+                                    } else if (protocol_is_error(&ss_msg)) {
+                                        error_code = protocol_get_error_code(&ss_msg);
+                                        const char *detail = (ss_msg.field_count >= 3) ? ss_msg.fields[2] : "Storage server error.";
+                                        safe_strcpy(error_detail, detail, sizeof(error_detail));
+                                    } else if (strcmp(ss_msg.fields[0], RESP_OK) != 0) {
+                                        error_code = ERR_INTERNAL_ERROR;
+                                        safe_strcpy(error_detail, "Unexpected storage server response.", sizeof(error_detail));
+                                    }
+                                    protocol_free_message(&ss_msg);
+                                }
+
+                                if (ss_resp_raw) {
+                                    free(ss_resp_raw);
+                                }
+
+                                if (error_code != 0) {
+                                    for (int j = rename_success_count - 1; j >= 0; j--) {
+                                        MovePlanEntry *done_entry = &plan[rename_success_indices[j]];
+                                        char *rb_raw = NULL;
+                                        const char *rb_fields[] = {
+                                            MSG_SS_RENAME,
+                                            done_entry->new_path,
+                                            done_entry->old_path,
+                                            done_entry->new_flat,
+                                            done_entry->old_flat
+                                        };
+                                        int rb_status = storage_server_send_and_wait(done_entry->ss, rb_fields, 5, &rb_raw);
+                                        if (rb_status == 0 && rb_raw) {
+                                            ProtocolMessage rb_msg;
+                                            if (protocol_parse_message(rb_raw, &rb_msg) == 0) {
+                                                protocol_free_message(&rb_msg);
+                                            }
+                                            free(rb_raw);
+                                        } else if (rb_raw) {
+                                            free(rb_raw);
+                                        }
+                                        log_message(LOG_WARNING, "NS", "Rollback attempted for '%s' after MOVE failure", done_entry->old_path);
+                                    }
+                                    break;
+                                }
+
+                                rename_success_indices[rename_success_count++] = i;
+                            }
+
+                            if (error_code != 0) {
+                                for (int i = 0; i < acquired_count; i++) {
+                                    storage_server_release(acquired_refs[i]);
+                                }
+                                pthread_mutex_unlock(&ns->state_lock);
+                                const char *detail = (error_detail[0] != '\0') ? error_detail : "Move failed.";
+                                send_error_and_log(ctx->conn_fd, error_code, detail, ctx->peer_ip, ctx->peer_port);
+                            } else {
+                                time_t now = get_current_time();
+                                for (int i = 0; i < plan_count; i++) {
+                                    MovePlanEntry *entry = &plan[i];
+                                    int meta_index = -1;
+                                    FileMetadata *meta = file_lookup_locked(ns, entry->old_path, &meta_index);
+                                    if (!meta) {
+                                        continue;
+                                    }
+
+                                    file_index_remove_entry(ns, entry->old_path);
+                                    safe_strcpy(meta->filename, entry->new_path, sizeof(meta->filename));
+                                    file_index_insert(ns, meta->filename, meta_index);
+                                    file_cache_rename(ns, entry->old_path, entry->new_path, meta_index);
+                                    meta->modified = now;
+                                    meta->last_access = now;
+                                }
+
+                                pthread_mutex_unlock(&ns->state_lock);
+
+                                for (int i = 0; i < acquired_count; i++) {
+                                    storage_server_release(acquired_refs[i]);
+                                }
+
+                                send_simple_ok(ctx->conn_fd, "Move completed.");
+                                log_message(LOG_INFO, "NS", "Moved '%s' to '%s' for %s", src_path, plan[0].new_path, ctx->username);
+                                ns_save_metadata(ns);
+                            }
+                        }
+
+                        safe_free(plan);
+                        safe_free(acquired_refs);
+                        safe_free(rename_success_indices);
+                    }
+                }
+            }
+        } else if (strcmp(command, MSG_DELETE) == 0) {
+            if (cmd_msg.field_count < 2) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Usage: DELETE <path>", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *target_path = cmd_msg.fields[1];
+
+                if (!ns_validate_logical_path(target_path)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid path requested for DELETE.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    typedef struct {
+                        char path[MAX_FILENAME_LENGTH];
+                        size_t name_len;
+                        int is_directory;
+                        StorageServerInfo *ss;
+                        long long size;
+                    } DeletePlanEntry;
+
+                    DeletePlanEntry *plan = NULL;
+                    int plan_count = 0;
+                    StorageServerInfo **acquired_refs = NULL;
+                    int acquired_count = 0;
+                    int error_code = 0;
+                    char error_detail[MAX_FIELD_SIZE];
+                    error_detail[0] = '\0';
+                    int *removed_flags = NULL;
+
+                    pthread_mutex_lock(&ns->state_lock);
+                    int capacity = ns->file_count > 0 ? ns->file_count : 1;
+                    plan = safe_calloc((size_t)capacity, sizeof(DeletePlanEntry));
+                    acquired_refs = safe_calloc((size_t)capacity, sizeof(StorageServerInfo *));
+                    removed_flags = safe_calloc((size_t)capacity, sizeof(int));
+                    if (!plan || !acquired_refs || !removed_flags) {
+                        error_code = ERR_INTERNAL_ERROR;
+                        safe_strcpy(error_detail, "Unable to allocate delete plan.", sizeof(error_detail));
+                    }
+
+                    do {
+                        if (error_code != 0) {
+                            break;
+                        }
+                        int target_index = -1;
+                        FileMetadata *target_meta = file_lookup_locked(ns, target_path, &target_index);
+                        if (!target_meta) {
+                            error_code = ERR_FILE_NOT_FOUND;
+                            safe_strcpy(error_detail, "Target path not found.", sizeof(error_detail));
+                            break;
+                        }
+
+                        if (strncmp(target_meta->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                            error_code = ERR_PERMISSION_DENIED;
+                            safe_strcpy(error_detail, "Only the owner may delete this entry.", sizeof(error_detail));
+                            break;
+                        }
+
+                        size_t prefix_len = strlen(target_path);
+                        for (int i = 0; i < ns->file_count; i++) {
+                            FileMetadata *fm = &ns->files[i];
+                            int match = (strcmp(fm->filename, target_path) == 0);
+                            if (!match && target_meta->is_directory) {
+                                if (strncmp(fm->filename, target_path, prefix_len) == 0 && fm->filename[prefix_len] == PATH_SEPARATOR) {
+                                    match = 1;
+                                }
+                            }
+                            if (!match) {
+                                continue;
+                            }
+
+                            if (strncmp(fm->owner, ctx->username, MAX_USERNAME_LENGTH) != 0) {
+                                error_code = ERR_PERMISSION_DENIED;
+                                safe_strcpy(error_detail, "Delete requires ownership of all contained entries.", sizeof(error_detail));
+                                break;
+                            }
+
+                            DeletePlanEntry entry;
+                            memset(&entry, 0, sizeof(entry));
+
+                            if (safe_strcpy(entry.path, fm->filename, sizeof(entry.path)) != 0) {
+                                error_code = ERR_INTERNAL_ERROR;
+                                safe_strcpy(error_detail, "Failed to record entry for deletion.", sizeof(error_detail));
+                                break;
+                            }
+
+                            entry.name_len = strlen(entry.path);
+                            entry.is_directory = fm->is_directory;
+                            entry.size = (fm->size > 0) ? fm->size : 0;
+                            entry.ss = NULL;
+
+                            if (!entry.is_directory) {
+                                StorageServerInfo *ss = NULL;
+                                for (int s = 0; s < ns->ss_count; s++) {
+                                    StorageServerInfo *candidate = ns->storage_servers[s];
+                                    if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
+                                        continue;
+                                    }
+                                    if (strncmp(candidate->client_ip, fm->ss_ip, MAX_IP_LENGTH) == 0 &&
+                                        candidate->client_port == fm->ss_port) {
+                                        ss = candidate;
+                                        break;
+                                    }
+                                }
+
+                                if (!ss) {
+                                    error_code = ERR_INTERNAL_ERROR;
+                                    safe_strcpy(error_detail, "Storage server unavailable for delete.", sizeof(error_detail));
+                                    break;
+                                }
+
+                                storage_server_acquire(ss);
+                                entry.ss = ss;
+                                acquired_refs[acquired_count++] = ss;
+                            }
+
+                            plan[plan_count++] = entry;
+                        }
+
+                        if (error_code != 0) {
+                            break;
+                        }
+
+                        if (plan_count == 0) {
+                            error_code = ERR_INTERNAL_ERROR;
+                            safe_strcpy(error_detail, "Delete plan was empty.", sizeof(error_detail));
+                        }
+                    } while (0);
+
+                    if (error_code != 0) {
+                        for (int i = 0; i < acquired_count; i++) {
+                            storage_server_release(acquired_refs[i]);
+                        }
+                        pthread_mutex_unlock(&ns->state_lock);
+                        const char *detail = (error_detail[0] != '\0') ? error_detail : "Delete failed.";
+                        send_error_and_log(ctx->conn_fd, error_code, detail, ctx->peer_ip, ctx->peer_port);
+                    } else {
+                        int delete_error = 0;
+                        char delete_detail[MAX_FIELD_SIZE];
+                        delete_detail[0] = '\0';
+
+                        for (int i = 0; i < plan_count && !delete_error; i++) {
+                            DeletePlanEntry *entry = &plan[i];
+                            if (entry->is_directory) {
+                                continue;
+                            }
+
+                            char *ss_resp_raw = NULL;
+                            const char *fields[] = {MSG_DELETE_FILE, entry->path};
+                            int ss_status = storage_server_send_and_wait(entry->ss, fields, 2, &ss_resp_raw);
+                            if (ss_status != 0) {
+                                delete_error = 1;
+                                safe_strcpy(delete_detail, "Storage server communication failure.", sizeof(delete_detail));
+                                if (ss_status == -2) {
+                                    safe_strcpy(delete_detail, "Storage server unavailable.", sizeof(delete_detail));
+                                } else if (ss_status == -3) {
+                                    safe_strcpy(delete_detail, "Failed to encode storage server command.", sizeof(delete_detail));
+                                } else if (ss_status == -4) {
+                                    safe_strcpy(delete_detail, "Failed to send command to storage server.", sizeof(delete_detail));
+                                } else if (ss_status == -5) {
+                                    safe_strcpy(delete_detail, "Storage server disconnected.", sizeof(delete_detail));
+                                } else if (ss_status == -6) {
+                                    safe_strcpy(delete_detail, "Incomplete response from storage server.", sizeof(delete_detail));
+                                }
+                            } else if (!ss_resp_raw) {
+                                delete_error = 1;
+                                safe_strcpy(delete_detail, "Missing storage server response.", sizeof(delete_detail));
+                            } else {
+                                ProtocolMessage ss_msg;
+                                if (protocol_parse_message(ss_resp_raw, &ss_msg) != 0 || ss_msg.field_count == 0) {
+                                    delete_error = 1;
+                                    safe_strcpy(delete_detail, "Failed to parse storage server response.", sizeof(delete_detail));
+                                } else if (protocol_is_error(&ss_msg)) {
+                                    delete_error = 1;
+                                    error_code = protocol_get_error_code(&ss_msg);
+                                    const char *detail = (ss_msg.field_count >= 3) ? ss_msg.fields[2] : "Storage server error.";
+                                    safe_strcpy(delete_detail, detail, sizeof(delete_detail));
+                                } else if (strcmp(ss_msg.fields[0], RESP_OK_DELETE) != 0) {
+                                    delete_error = 1;
+                                    safe_strcpy(delete_detail, "Unexpected storage server response.", sizeof(delete_detail));
+                                }
+                                protocol_free_message(&ss_msg);
+                            }
+
+                            if (ss_resp_raw) {
+                                free(ss_resp_raw);
+                            }
+                        }
+
+                        if (delete_error) {
+                            for (int i = 0; i < acquired_count; i++) {
+                                storage_server_release(acquired_refs[i]);
+                            }
+                            pthread_mutex_unlock(&ns->state_lock);
+                            int send_code = (error_code != 0) ? error_code : ERR_INTERNAL_ERROR;
+                            const char *detail = (delete_detail[0] != '\0') ? delete_detail : "Delete failed.";
+                            send_error_and_log(ctx->conn_fd, send_code, detail, ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            int removed_entries = 0;
+
+                            while (removed_entries < plan_count) {
+                                int best = -1;
+                                size_t best_len = 0;
+                                for (int i = 0; i < plan_count; i++) {
+                                    if (removed_flags[i]) {
+                                        continue;
+                                    }
+                                    if (plan[i].name_len >= best_len) {
+                                        best = i;
+                                        best_len = plan[i].name_len;
+                                    }
+                                }
+                                if (best < 0) {
+                                    break;
+                                }
+
+                                DeletePlanEntry *entry = &plan[best];
+                                StorageServerInfo *ss = entry->ss;
+                                long long removed_size = entry->size;
+
+                                if (remove_file_metadata_locked(ns, entry->path)) {
+                                    if (ss) {
+                                        if (ss->total_files > 0) {
+                                            ss->total_files--;
+                                        }
+                                        if (removed_size > 0) {
+                                            if (ss->total_bytes >= removed_size) {
+                                                ss->total_bytes -= removed_size;
+                                            } else {
+                                                ss->total_bytes = 0;
+                                            }
+                                        }
+                                    }
+
+                                    for (int r = 0; r < ns->request_count; r++) {
+                                        AccessRequest *req = &ns->access_requests[r];
+                                        if (req->is_pending && strcmp(req->filename, entry->path) == 0) {
+                                            req->is_pending = 0;
+                                            log_message(LOG_INFO, "NS", "Auto-cancelled request #%d for deleted entry '%s'", req->id, entry->path);
+                                        }
+                                    }
+                                }
+
+                                removed_flags[best] = 1;
+                                removed_entries++;
+                            }
+
+                            pthread_mutex_unlock(&ns->state_lock);
+
+                            for (int i = 0; i < acquired_count; i++) {
+                                storage_server_release(acquired_refs[i]);
+                            }
+
+                            char detail_buf[MAX_FIELD_SIZE];
+                            if (plan_count == 1) {
+                                snprintf(detail_buf, sizeof(detail_buf), "Entry '%s' deleted.", target_path);
+                            } else {
+                                snprintf(detail_buf, sizeof(detail_buf), "Deleted %d entries under '%s'.", plan_count, target_path);
+                            }
+                            send_simple_ok(ctx->conn_fd, detail_buf);
+                            log_message(LOG_INFO, "NS", "Deleted '%s' (%d entries) for %s", target_path, plan_count, ctx->username);
+                            ns_save_metadata(ns);
                         }
                     }
+
+                    safe_free(plan);
+                    safe_free(acquired_refs);
+                    safe_free(removed_flags);
                 }
             }
         } else if (strcmp(command, MSG_REQ_LOC) == 0) {
@@ -3310,7 +3952,7 @@ int ns_start(NameServer *ns) {
         log_message(LOG_ERROR, "NS", "Failed to init thread attributes: %s", strerror(errno));
     }
 
-    size_t stack_size = 4 * 1024 * 1024; 
+    size_t stack_size = 8 * 1024 * 1024; 
     if (pthread_attr_setstacksize(&attr, stack_size) != 0) {
         log_message(LOG_ERROR, "NS", "Failed to set stack size: %s", strerror(errno));
     }
@@ -3354,6 +3996,9 @@ int ns_start(NameServer *ns) {
 
         pthread_t thread_id;
         //call the connection_thread function to handle the connection and detach subsequently
+
+
+
         if (pthread_create(&thread_id, &attr, connection_thread, ctx) != 0) {
             log_message(LOG_ERROR, "NS", "Failed to spawn thread for %s:%d: %s", peer_ip, peer_port, strerror(errno));
             close(conn_fd);
