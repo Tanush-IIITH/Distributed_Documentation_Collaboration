@@ -978,16 +978,25 @@ static void ns_load_metadata(NameServer *ns) {
 
         if (strncmp(line, "FILE|", 5) == 0) {
             char *payload = line + 5;
-            char *saveptr = NULL;
             char *parts[11] = {0};
             int token_count = 0;
+
+            // Manually split on '|' so empty fields are preserved (e.g., missing ss_ip for folders)
+            char *cursor = payload;
             for (int idx = 0; idx < 11; idx++) {
-                parts[idx] = (idx == 0) ? strtok_r(payload, "|", &saveptr)
-                                        : strtok_r(NULL, "|", &saveptr);
-                if (!parts[idx]) {
+                if (!cursor) {
                     break;
                 }
+                parts[idx] = cursor;
                 token_count++;
+
+                char *sep = strchr(cursor, '|');
+                if (!sep) {
+                    cursor = NULL;
+                } else {
+                    *sep = '\0';
+                    cursor = sep + 1;
+                }
             }
 
             if (!parts[0] || !validate_filename(parts[0])) {
