@@ -46,6 +46,7 @@ static void handle_client_checkpoint(StorageServer *ss, int fd, ProtocolMessage 
 static void handle_client_viewcheckpoint(StorageServer *ss, int fd, ProtocolMessage *msg);
 static void handle_client_revert(StorageServer *ss, int fd, ProtocolMessage *msg);
 static void handle_client_listcheckpoints(StorageServer *ss, int fd, ProtocolMessage *msg);
+static void handle_ss_copy(StorageServer *ss, ProtocolMessage *msg);
 
 typedef struct {
     StorageServer *ss;
@@ -452,6 +453,36 @@ static void ss_touch_file_metadata(FileRecord *rec, const char *username, int up
         rec->modified = now;
     }
     ss_write_metadata(rec);
+}
+
+static void ss_sync_metadata_to_ns(StorageServer *ss, FileRecord *rec) {
+    if (!ss || !rec || ss->ns_sockfd < 0) {
+        return;
+    }
+
+    long size = get_file_size(rec->filepath);
+    int words = 0;
+    int chars = 0;
+    char *content = ss_read_file_content(rec->filepath);
+    if (content) {
+        words = count_words(content);
+        chars = count_chars(content);
+        free(content);
+    }
+
+    char size_buf[32];
+    char word_buf[32];
+    char char_buf[32];
+    snprintf(size_buf, sizeof(size_buf), "%ld", size >= 0 ? size : 0);
+    snprintf(word_buf, sizeof(word_buf), "%d", words);
+    snprintf(char_buf, sizeof(char_buf), "%d", chars);
+
+    const char *fields[] = {MSG_WRITE_COMPLETE, rec->filename, size_buf, word_buf, char_buf};
+    char *msg = protocol_build_message(fields, 5);
+    if (msg) {
+        protocol_send_message(ss->ns_sockfd, msg);
+        free(msg);
+    }
 }
 
 static WriteSession *ss_find_session(StorageServer *ss, int client_fd) {
@@ -997,6 +1028,8 @@ static void *ns_control_loop(void *arg) {
                     }
                 }
             }
+        } else if (strcmp(command, MSG_SS_COPY) == 0) {
+            handle_ss_copy(ss, &msg);
         } else {
             log_message(LOG_WARNING, "SS", "Unknown NS command: %s", command);
         }
@@ -1218,6 +1251,33 @@ static char *ss_read_file_content(const char *path) {
     buffer[read] = '\0';
     fclose(fp);
     return buffer;
+}
+
+static int ss_connect_to_peer(const char *ip, int port) {
+    if (!ip || port <= 0) {
+        return -1;
+    }
+
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    return sockfd;
 }
 
 static int ss_write_file_content(const char *path, const char *data) {
@@ -1758,6 +1818,218 @@ static void handle_client_stream(StorageServer *ss, int fd, ProtocolMessage *msg
     free(content);
 }
 
+static void handle_ss_copy(StorageServer *ss, ProtocolMessage *msg) {
+    if (!ss || !msg) {
+        return;
+    }
+
+    if (msg->field_count < 6) {
+        ss_send_ns_error(ss, ERR_INVALID_REQUEST, "SS_COPY missing fields");
+        return;
+    }
+
+    const char *dest_filename = msg->fields[1];
+    const char *src_ip = msg->fields[2];
+    const char *src_port_str = msg->fields[3];
+    const char *src_filename = msg->fields[4];
+    const char *username = msg->fields[5];
+
+    if (!validate_filename(dest_filename) ||
+        !validate_filename(src_filename) ||
+        !validate_username(username)) {
+        ss_send_ns_error(ss, ERR_INVALID_REQUEST, "Invalid COPY request payload");
+        return;
+    }
+
+    int source_is_local = (strcmp(src_ip, "LOCAL") == 0);
+    int src_port = 0;
+    if (!source_is_local) {
+        if (parse_int(src_port_str, &src_port) != 0 || src_port <= 0) {
+            ss_send_ns_error(ss, ERR_INVALID_REQUEST, "Invalid source endpoint");
+            return;
+        }
+    }
+
+    pthread_mutex_lock(&ss->files_lock);
+    FileRecord *dest_rec = ss_find_file(ss, dest_filename);
+    FileRecord *src_rec = NULL;
+    if (source_is_local) {
+        src_rec = ss_find_file(ss, src_filename);
+    }
+
+    if (!dest_rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "Destination file not found");
+        return;
+    }
+    if (source_is_local && !src_rec) {
+        pthread_mutex_unlock(&ss->files_lock);
+        ss_send_ns_error(ss, ERR_FILE_NOT_FOUND, "Source file not found");
+        return;
+    }
+
+    FileRecord *first_lock = dest_rec;
+    FileRecord *second_lock = NULL;
+    if (source_is_local && src_rec && src_rec != dest_rec) {
+        second_lock = src_rec;
+        if (first_lock > second_lock) {
+            FileRecord *tmp = first_lock;
+            first_lock = second_lock;
+            second_lock = tmp;
+        }
+    }
+
+    pthread_mutex_lock(&first_lock->file_lock);
+    if (second_lock) {
+        pthread_mutex_lock(&second_lock->file_lock);
+    }
+    pthread_mutex_unlock(&ss->files_lock);
+
+    int src_locked = (source_is_local && src_rec && src_rec != dest_rec);
+
+    pthread_mutex_lock(&ss->sessions_lock);
+    int dest_busy = ss_file_has_active_writers(ss, dest_rec);
+    int src_busy = (source_is_local && src_rec) ? ss_file_has_active_writers(ss, src_rec) : 0;
+    pthread_mutex_unlock(&ss->sessions_lock);
+
+    if (dest_busy || src_busy) {
+        if (src_locked) {
+            pthread_mutex_unlock(&src_rec->file_lock);
+        }
+        pthread_mutex_unlock(&dest_rec->file_lock);
+        if (dest_busy) {
+            ss_send_ns_error(ss, ERR_SENTENCE_LOCKED, "Destination locked for writing");
+        } else {
+            ss_send_ns_error(ss, ERR_SENTENCE_LOCKED, "Source locked for writing");
+        }
+        return;
+    }
+
+    char temp_path[MAX_PATH_LENGTH];
+    snprintf(temp_path, sizeof(temp_path), "%s.copytmp", dest_rec->filepath);
+    unlink(temp_path);
+
+    int success = 0;
+    int failure_code = ERR_INTERNAL_ERROR;
+    const char *failure_msg = "Failed to copy file content";
+
+    if (source_is_local) {
+        if (ss_copy_file(src_rec->filepath, temp_path) == 0) {
+            success = 1;
+        } else {
+            failure_msg = "Failed to clone local source file";
+        }
+        if (src_locked) {
+            pthread_mutex_unlock(&src_rec->file_lock);
+            src_locked = 0;
+        }
+    } else {
+        int peer_fd = ss_connect_to_peer(src_ip, src_port);
+        if (peer_fd < 0) {
+            failure_msg = "Failed to reach source server";
+        } else {
+            const char *req_fields[] = {MSG_REQ_READ, username, src_filename};
+            char *req = protocol_build_message(req_fields, 3);
+            int request_sent = (req && protocol_send_message(peer_fd, req) >= 0);
+            if (req) {
+                free(req);
+            }
+
+            if (!request_sent) {
+                failure_msg = "Failed to request source content";
+                close(peer_fd);
+            } else {
+                FILE *fp = fopen(temp_path, "wb");
+                if (!fp) {
+                    failure_msg = "Failed to create temporary file";
+                    close(peer_fd);
+                } else {
+                    int stream_error = 0;
+                    while (1) {
+                        char *raw = protocol_receive_message(peer_fd);
+                        if (!raw) {
+                            stream_error = 1;
+                            failure_msg = "Connection dropped during COPY";
+                            break;
+                        }
+
+                        ProtocolMessage peer_msg;
+                        if (protocol_parse_message(raw, &peer_msg) != 0 || peer_msg.field_count == 0) {
+                            free(raw);
+                            stream_error = 1;
+                            failure_msg = "Invalid data from source server";
+                            break;
+                        }
+
+                        if (protocol_is_error(&peer_msg)) {
+                            int peer_code = protocol_get_error_code(&peer_msg);
+                            if (peer_code == ERR_FILE_NOT_FOUND) {
+                                failure_code = ERR_FILE_NOT_FOUND;
+                                failure_msg = "Source file not found";
+                            } else if (peer_code == ERR_PERMISSION_DENIED) {
+                                failure_code = ERR_PERMISSION_DENIED;
+                                failure_msg = "Source access denied";
+                            } else {
+                                failure_msg = "Source server rejected COPY";
+                            }
+                            protocol_free_message(&peer_msg);
+                            free(raw);
+                            stream_error = 1;
+                            break;
+                        }
+
+                        const char *type = peer_msg.fields[0];
+                        if (strcmp(type, RESP_OK_CONTENT) == 0 && peer_msg.field_count >= 2) {
+                            const char *chunk = peer_msg.fields[1];
+                            size_t len = strlen(chunk);
+                            if (fwrite(chunk, 1, len, fp) != len) {
+                                failure_msg = "Failed to persist stream chunk";
+                                protocol_free_message(&peer_msg);
+                                free(raw);
+                                stream_error = 1;
+                                break;
+                            }
+                        } else if (strcmp(type, RESP_OK_READ_END) == 0) {
+                            protocol_free_message(&peer_msg);
+                            free(raw);
+                            success = 1;
+                            break;
+                        }
+
+                        protocol_free_message(&peer_msg);
+                        free(raw);
+                    }
+
+                    fclose(fp);
+                    close(peer_fd);
+                    if (stream_error || !success) {
+                        unlink(temp_path);
+                    }
+                }
+            }
+        }
+    }
+
+    if (success) {
+        if (rename(temp_path, dest_rec->filepath) != 0) {
+            failure_msg = "Failed to finalize destination file";
+            success = 0;
+        }
+    }
+
+    if (!success) {
+        unlink(temp_path);
+        pthread_mutex_unlock(&dest_rec->file_lock);
+        ss_send_ns_error(ss, failure_code, failure_msg);
+        return;
+    }
+
+    ss_touch_file_metadata(dest_rec, username, 1);
+    ss_sync_metadata_to_ns(ss, dest_rec);
+    pthread_mutex_unlock(&dest_rec->file_lock);
+    send_simple_ok(ss->ns_sockfd, "Copy successful");
+}
+
 static void handle_client_write_lock(StorageServer *ss, int fd, ProtocolMessage *msg) {
     if (msg->field_count < 4) {
         send_error_response(fd, ERR_INVALID_REQUEST, "Missing fields in REQ_WRITE_LOCK");
@@ -2040,30 +2312,7 @@ static void handle_client_etirw(StorageServer *ss, int fd) {
 
     log_message(LOG_INFO, "SS", "Write committed on %s by %s", rec->filename, username_copy);
 
-    long new_size = get_file_size(rec->filepath);
-    int new_words = 0;
-    int new_chars = 0;
-
-    char *final_content = ss_read_file_content(rec->filepath);
-    if (final_content) {
-        new_words = count_words(final_content);
-        new_chars = count_chars(final_content);
-        free(final_content);
-    }
-
-    char size_buf[32];
-    char word_buf[32];
-    char char_buf[32];
-    snprintf(size_buf, sizeof(size_buf), "%ld", new_size);
-    snprintf(word_buf, sizeof(word_buf), "%d", new_words);
-    snprintf(char_buf, sizeof(char_buf), "%d", new_chars);
-
-    const char *sync_fields[] = {MSG_WRITE_COMPLETE, rec->filename, size_buf, word_buf, char_buf};
-    char *sync_msg = protocol_build_message(sync_fields, 5);
-    if (sync_msg) {
-        protocol_send_message(ss->ns_sockfd, sync_msg);
-        free(sync_msg);
-    }
+    ss_sync_metadata_to_ns(ss, rec);
 }
 
 static void handle_client_checkpoint(StorageServer *ss, int fd, ProtocolMessage *msg) {

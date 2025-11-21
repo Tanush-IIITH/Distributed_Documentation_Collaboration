@@ -15,6 +15,7 @@ static int client_handle_addaccess(Client *client, const char *perm_flag, const 
 static int client_handle_remaccess(Client *client, const char *filename, const char *username);
 static int client_handle_create(Client *client, const char *filename);
 static int client_handle_delete(Client *client, const char *filename);
+static int client_handle_copy(Client *client, const char *src, const char *dest);
 static int client_handle_info(Client *client, const char *filename);
 static int client_handle_read(Client *client, const char *filename);
 static int client_handle_undo(Client *client, const char *filename);
@@ -221,6 +222,14 @@ int client_process_command(Client *client, const char *input) {
             return -1;
         }
         return client_handle_delete(client, filename);
+    } else if (strcasecmp(command, "COPY") == 0) {
+        char src[MAX_FILENAME_LENGTH];
+        char dest[MAX_FILENAME_LENGTH];
+        if (sscanf(input, "%*s %511s %511s", src, dest) != 2) {
+            printf("Usage: COPY <source_filename> <dest_filename>\n");
+            return -1;
+        }
+        return client_handle_copy(client, src, dest);
     } else if (strcasecmp(command, "STREAM") == 0) {
         char filename[MAX_FILENAME_LENGTH];
         if (sscanf(input, "%*s %511s", filename) != 1) {
@@ -875,6 +884,43 @@ static int client_handle_delete(Client *client, const char *filename) {
     char *raw = NULL;
     if (client_read_response(client, &resp, &raw) != 0) {
         printf("No response from Name Server for DELETE\n");
+        return -1;
+    }
+
+    client_print_ns_response(&resp);
+    int is_error = protocol_is_error(&resp);
+
+    protocol_free_message(&resp);
+    free(raw);
+
+    return is_error ? -1 : 0;
+}
+
+static int client_handle_copy(Client *client, const char *src, const char *dest) {
+    if (!client || client->ns_sockfd < 0 || !src || !dest) {
+        return -1;
+    }
+
+    if (!validate_filename(src) || !validate_filename(dest)) {
+        printf("Invalid filename(s).\n");
+        return -1;
+    }
+
+    const char *fields[] = {MSG_COPY, src, dest};
+    char *message = protocol_build_message(fields, 3);
+    if (!message) {
+        return -1;
+    }
+
+    if (client_send_message(client, message) < 0) {
+        printf("Failed to send COPY command\n");
+        return -1;
+    }
+
+    ProtocolMessage resp;
+    char *raw = NULL;
+    if (client_read_response(client, &resp, &raw) != 0) {
+        printf("No response from Name Server for COPY\n");
         return -1;
     }
 
@@ -2007,6 +2053,7 @@ int client_start(Client *client) {
             printf("Available commands:\n");
             printf("  CREATE <filename>\n");
             printf("  DELETE <filename>\n");
+            printf("  COPY <source> <dest>\n");
             printf("  READ <filename>\n");
             printf("  WRITE <filename> <sentence_index>\n");
             printf("  VIEW [-a] [-l] [-al]\n");
