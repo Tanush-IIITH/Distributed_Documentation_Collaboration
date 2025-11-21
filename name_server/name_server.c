@@ -27,6 +27,7 @@ static int ns_is_descendant_path(const char *candidate, const char *ancestor);
 static int ns_normalize_destination(const char *input, char *normalized, size_t size);
 static int file_index_remove_entry(NameServer *ns, const char *filename);
 static void file_cache_invalidate(NameServer *ns, const char *filename);
+static unsigned long hash_filename(const char *str);
 static void file_cache_rename(NameServer *ns, const char *old_name, const char *new_name, int array_index);
 
 // Initialize the Name Server
