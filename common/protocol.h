@@ -65,6 +65,9 @@
 // C -> NS: REMACCESS|filename|username_to_remove\n
 #define MSG_REMACCESS "REMACCESS"
 
+// C -> NS: COPY|source_filename|dest_filename
+#define MSG_COPY "COPY"
+
 // Mailbox commands
 // C -> NS: REQUESTACCESS|filename|permission
 #define MSG_REQUEST_ACCESS "REQUESTACCESS"
@@ -113,6 +116,8 @@
 
 // NS -> SS: SS_RENAME|old_logical|new_logical|old_flat|new_flat\n
 #define MSG_SS_RENAME "SS_RENAME"
+// NS -> SS: SS_COPY|dest_file|source_ip|source_port|source_file|username
+#define MSG_SS_COPY "SS_COPY"
 
 // ============================================================================
 // MESSAGE TYPES - LOCATION REQUEST (C -> NS)

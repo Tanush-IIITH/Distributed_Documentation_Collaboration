@@ -111,6 +111,17 @@ static int send_info_line(int fd, const char *line_text) {
     return rc < 0 ? -1 : 0;
 }
 
+static void ns_release_state_lock(NameServer *ns, int *state_locked_flag) {
+    if (!ns || !state_locked_flag) {
+        return;
+    }
+
+    if (*state_locked_flag) {
+        pthread_mutex_unlock(&ns->state_lock);
+        *state_locked_flag = 0;
+    }
+}
+
 static void acl_append_token(char *buffer, size_t buffer_size, const char *token, int *is_first) {
     if (!buffer || buffer_size == 0 || !token || !token[0] || !is_first) {
         return;
@@ -1843,6 +1854,136 @@ static void run_client_loop(ConnectionContext *ctx) {
                     send_simple_ok(ctx->conn_fd, "Request rejected.");
                 } else {
                     send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid or non-pending request ID.", ctx->peer_ip, ctx->peer_port);
+                }
+            }
+        } else if (strcmp(command, MSG_COPY) == 0) {
+            if (cmd_msg.field_count < 3) {
+                send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Usage: COPY <source> <dest>", ctx->peer_ip, ctx->peer_port);
+            } else {
+                const char *src_name = cmd_msg.fields[1];
+                const char *dest_name = cmd_msg.fields[2];
+
+                if (!validate_filename(src_name) || !validate_filename(dest_name)) {
+                    send_error_and_log(ctx->conn_fd, ERR_INVALID_REQUEST, "Invalid filename(s) for COPY.", ctx->peer_ip, ctx->peer_port);
+                } else if (ctx->username[0] == '\0') {
+                    send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
+                } else {
+                    int src_idx = -1;
+                    pthread_mutex_lock(&ns->state_lock);
+                    int state_locked = 1;
+                    FileMetadata *src_file = file_lookup_locked(ns, src_name, &src_idx);
+                    FileMetadata *dest_file = file_lookup_locked(ns, dest_name, NULL);
+
+                    do {
+                        if (!src_file) {
+                            send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "Source file not found", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        if (!dest_file) {
+                            send_error_and_log(ctx->conn_fd, ERR_FILE_NOT_FOUND, "Destination file not found (create it first)", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        if (!file_has_read_access(src_file, ctx->username)) {
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "No read access to source", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        if (!file_has_write_access(dest_file, ctx->username)) {
+                            send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "No write access to destination", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        StorageServerInfo *src_ss = NULL;
+                        StorageServerInfo *dest_ss = NULL;
+                        for (int i = 0; i < ns->ss_count; i++) {
+                            StorageServerInfo *candidate = ns->storage_servers[i];
+                            if (!candidate || !candidate->is_alive || candidate->sockfd < 0) {
+                                continue;
+                            }
+
+                            if (!src_ss && strncmp(candidate->client_ip, src_file->ss_ip, MAX_IP_LENGTH) == 0 &&
+                                candidate->client_port == src_file->ss_port) {
+                                src_ss = candidate;
+                            }
+                            if (!dest_ss && strncmp(candidate->client_ip, dest_file->ss_ip, MAX_IP_LENGTH) == 0 &&
+                                candidate->client_port == dest_file->ss_port) {
+                                dest_ss = candidate;
+                            }
+                            if (src_ss && dest_ss) {
+                                break;
+                            }
+                        }
+
+                        if (!dest_ss) {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Destination storage server offline", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        if (!src_ss) {
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Source storage server offline", ctx->peer_ip, ctx->peer_port);
+                            break;
+                        }
+
+                        storage_server_acquire(dest_ss);
+                        pthread_mutex_unlock(&ns->state_lock);
+                        state_locked = 0;
+
+                        const char *source_ip = NULL;
+                        char port_buf[16];
+                        if (src_ss == dest_ss) {
+                            source_ip = "LOCAL";
+                            snprintf(port_buf, sizeof(port_buf), "0");
+                        } else {
+                            source_ip = src_ss->client_ip;
+                            snprintf(port_buf, sizeof(port_buf), "%d", src_ss->client_port);
+                        }
+
+                        const char *ss_fields[] = {MSG_SS_COPY, dest_name, source_ip, port_buf, src_name, ctx->username};
+                        char *ss_resp = NULL;
+                        int ss_status = storage_server_send_and_wait(dest_ss, ss_fields, 6, &ss_resp);
+                        storage_server_release(dest_ss);
+
+                        if (ss_status != 0 || !ss_resp) {
+                            if (ss_resp) {
+                                free(ss_resp);
+                            }
+                            send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Copy failed on Storage Server", ctx->peer_ip, ctx->peer_port);
+                        } else {
+                            protocol_send_message(ctx->conn_fd, ss_resp);
+
+                            int copy_success = 0;
+                            ProtocolMessage forwarded;
+                            if (protocol_parse_message(ss_resp, &forwarded) == 0) {
+                                copy_success = !protocol_is_error(&forwarded);
+                                protocol_free_message(&forwarded);
+                            }
+                            free(ss_resp);
+
+                            int persist_metadata = 0;
+
+                            if (copy_success) {
+                                pthread_mutex_lock(&ns->state_lock);
+                                state_locked = 1;
+                                if (src_idx >= 0 && src_idx < ns->file_count) {
+                                    FileMetadata *tracked = &ns->files[src_idx];
+                                    tracked->last_access = get_current_time();
+                                    safe_strcpy(tracked->last_access_user, ctx->username, sizeof(tracked->last_access_user));
+                                    persist_metadata = 1;
+                                }
+                                ns_release_state_lock(ns, &state_locked);
+                            }
+
+                            if (persist_metadata) {
+                                ns_save_metadata(ns);
+                            }
+                        }
+
+                        break;
+                    } while (0);
+
+                    ns_release_state_lock(ns, &state_locked);
                 }
             }
         } else if (strcmp(command, MSG_CREATE) == 0) {
