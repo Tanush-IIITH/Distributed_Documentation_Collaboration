@@ -67,3 +67,5 @@ docs/.doctrees/
 # Backup files
 *.backup
 *-backup
+
+*.db
