@@ -1385,14 +1385,14 @@ static void run_client_loop(ConnectionContext *ctx) {
                         }
 
                         if (!send_failed) {
-                            snprintf(line, sizeof(line), "Words: %s", "N/A");
+                            snprintf(line, sizeof(line), "Words: %lld", file_snapshot.word_count);
                             if (send_info_line(ctx->conn_fd, line) != 0) {
                                 send_failed = 1;
                             }
                         }
 
                         if (!send_failed) {
-                            snprintf(line, sizeof(line), "Chars: %s", "N/A");
+                            snprintf(line, sizeof(line), "Chars: %lld", file_snapshot.char_count);
                             if (send_info_line(ctx->conn_fd, line) != 0) {
                                 send_failed = 1;
                             }
