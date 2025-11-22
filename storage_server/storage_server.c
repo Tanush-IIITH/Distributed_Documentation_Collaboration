@@ -44,6 +44,7 @@ static WriteSession *ss_find_session_by_sentence(StorageServer *ss, FileRecord *
 static int ss_file_has_active_writers(StorageServer *ss, FileRecord *rec);
 static int ss_file_exists(const char *path);
 static int ss_copy_file(const char *src_path, const char *dest_path);
+static FILE *ss_open_truncating_binary(const char *path);
 static void ss_sanitize_tag(const char *tag, char *buffer, size_t size);
 static CheckpointRecord *ss_find_checkpoint(FileRecord *rec, const char *tag);
 static void ss_prune_oldest_checkpoint(FileRecord *rec);
@@ -158,6 +159,15 @@ static int ss_file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+static FILE *ss_open_truncating_binary(const char *path) {
+    if (!path || !path[0]) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    return fopen(path, "wb");
+}
+
 static int ss_copy_file(const char *src_path, const char *dest_path) {
     if (!src_path || !dest_path) {
         return -1;
@@ -168,7 +178,7 @@ static int ss_copy_file(const char *src_path, const char *dest_path) {
         return -1;
     }
 
-    FILE *dest = fopen(dest_path, "wb");
+    FILE *dest = ss_open_truncating_binary(dest_path);
     if (!dest) {
         fclose(src);
         return -1;
@@ -2046,7 +2056,7 @@ static void handle_ss_copy(StorageServer *ss, ProtocolMessage *msg) {
                 failure_msg = "Failed to request source content";
                 close(peer_fd);
             } else {
-                FILE *fp = fopen(temp_path, "wb");
+                FILE *fp = ss_open_truncating_binary(temp_path);
                 if (!fp) {
                     failure_msg = "Failed to create temporary file";
                     close(peer_fd);
@@ -2087,9 +2097,9 @@ static void handle_ss_copy(StorageServer *ss, ProtocolMessage *msg) {
 
                         const char *type = peer_msg.fields[0];
                         if (strcmp(type, RESP_OK_CONTENT) == 0 && peer_msg.field_count >= 2) {
-                            const char *chunk = peer_msg.fields[1];
+                            const char *chunk = peer_msg.fields[1] ? peer_msg.fields[1] : "";
                             size_t len = strlen(chunk);
-                            if (fwrite(chunk, 1, len, fp) != len) {
+                            if (len > 0 && fwrite(chunk, 1, len, fp) != len) {
                                 failure_msg = "Failed to persist stream chunk";
                                 protocol_free_message(&peer_msg);
                                 free(raw);
