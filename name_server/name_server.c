@@ -914,7 +914,10 @@ static void ns_save_metadata(NameServer *ns) {
     fprintf(fp, "%d\n", ns->file_count);
     for (int i = 0; i < ns->file_count; i++) {
         FileMetadata *f = &ns->files[i];
-        fprintf(fp, "FILE|%s|%s|%s|%d|%lld|%lld|%lld|%lld|%lld|%lld|%d\n",
+        const char *last_access_user = f->last_access_user[0] ? f->last_access_user : "N/A";
+        const char *last_modified_user = f->last_modified_user[0] ? f->last_modified_user : "N/A";
+
+        fprintf(fp, "FILE|%s|%s|%s|%d|%lld|%lld|%lld|%lld|%lld|%lld|%d|%s|%s\n",
                 f->filename,
                 f->owner,
                 f->ss_ip,
@@ -925,7 +928,9 @@ static void ns_save_metadata(NameServer *ns) {
                 (long long)f->created,
                 (long long)f->modified,
                 (long long)f->last_access,
-                f->is_directory ? 1 : 0);
+            f->is_directory ? 1 : 0,
+            last_access_user,
+            last_modified_user);
 
         fprintf(fp, "READ|");
         for (int j = 0; j < f->read_access_count; j++) {
@@ -978,12 +983,12 @@ static void ns_load_metadata(NameServer *ns) {
 
         if (strncmp(line, "FILE|", 5) == 0) {
             char *payload = line + 5;
-            char *parts[11] = {0};
+            char *parts[13] = {0};
             int token_count = 0;
 
             // Manually split on '|' so empty fields are preserved (e.g., missing ss_ip for folders)
             char *cursor = payload;
-            for (int idx = 0; idx < 11; idx++) {
+            for (int idx = 0; idx < 13; idx++) {
                 if (!cursor) {
                     break;
                 }
@@ -1041,6 +1046,20 @@ static void ns_load_metadata(NameServer *ns) {
                 if (parts[10]) {
                     file->is_directory = atoi(parts[10]) ? 1 : 0;
                 }
+                if (token_count >= 12 && parts[11]) {
+                    if (strcmp(parts[11], "N/A") == 0) {
+                        file->last_access_user[0] = '\0';
+                    } else {
+                        safe_strcpy(file->last_access_user, parts[11], sizeof(file->last_access_user));
+                    }
+                }
+                if (token_count >= 13 && parts[12]) {
+                    if (strcmp(parts[12], "N/A") == 0) {
+                        file->last_modified_user[0] = '\0';
+                    } else {
+                        safe_strcpy(file->last_modified_user, parts[12], sizeof(file->last_modified_user));
+                    }
+                }
             } else {
                 // Legacy metadata (without counts) -> set counters to zero
                 if (parts[5]) {
@@ -1053,6 +1072,13 @@ static void ns_load_metadata(NameServer *ns) {
                     file->last_access = (time_t)atoll(parts[7]);
                 }
                 file->is_directory = 0;
+            }
+
+            if (token_count < 12) {
+                file->last_access_user[0] = '\0';
+            }
+            if (token_count < 13) {
+                file->last_modified_user[0] = '\0';
             }
 
             file_index_insert(ns, file->filename, ns->file_count);
@@ -1333,7 +1359,6 @@ static void run_client_loop(ConnectionContext *ctx) {
                     send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Client identity unknown.", ctx->peer_ip, ctx->peer_port);
                 } else {
                     int error_sent = 0;
-                    int metadata_updated = 0;
                     FileMetadata file_snapshot;
                     memset(&file_snapshot, 0, sizeof(file_snapshot));
 
@@ -1349,9 +1374,6 @@ static void run_client_loop(ConnectionContext *ctx) {
                             error_sent = 1;
                         } else {
                             file_snapshot = *file;
-                            file->last_access = get_current_time();
-                            file_snapshot.last_access = file->last_access;
-                            metadata_updated = 1;
                         }
                     }
                     pthread_mutex_unlock(&ns->state_lock);
@@ -1421,13 +1443,14 @@ static void run_client_loop(ConnectionContext *ctx) {
                         if (!send_failed) {
                             long long modified_epoch = (long long)file_snapshot.modified;
                             char modified_buf[64];
+                            const char *mod_user = file_snapshot.last_modified_user[0] ? file_snapshot.last_modified_user : "N/A";
                             if (modified_epoch > 0) {
                                 const char *tmp = format_time((time_t)modified_epoch);
                                 safe_strcpy(modified_buf, tmp ? tmp : "N/A", sizeof(modified_buf));
                             } else {
                                 safe_strcpy(modified_buf, "N/A", sizeof(modified_buf));
                             }
-                            snprintf(line, sizeof(line), "Modified: %s", modified_buf);
+                            snprintf(line, sizeof(line), "--> Last Modified: %s by %s", modified_buf, mod_user);
                             if (send_info_line(ctx->conn_fd, line) != 0) {
                                 send_failed = 1;
                             }
@@ -1436,21 +1459,14 @@ static void run_client_loop(ConnectionContext *ctx) {
                         if (!send_failed) {
                             long long access_epoch = (long long)file_snapshot.last_access;
                             char access_buf[64];
+                            const char *acc_user = file_snapshot.last_access_user[0] ? file_snapshot.last_access_user : "N/A";
                             if (access_epoch > 0) {
                                 const char *tmp = format_time((time_t)access_epoch);
                                 safe_strcpy(access_buf, tmp ? tmp : "N/A", sizeof(access_buf));
                             } else {
                                 safe_strcpy(access_buf, "N/A", sizeof(access_buf));
                             }
-                            snprintf(line, sizeof(line), "Last Access: %s", access_buf);
-                            if (send_info_line(ctx->conn_fd, line) != 0) {
-                                send_failed = 1;
-                            }
-                        }
-
-                        if (!send_failed) {
-                            const char *last_user = "N/A";
-                            snprintf(line, sizeof(line), "Last Access User: %s", last_user);
+                            snprintf(line, sizeof(line), "--> Last Accessed: %s by %s", access_buf, acc_user);
                             if (send_info_line(ctx->conn_fd, line) != 0) {
                                 send_failed = 1;
                             }
@@ -1512,10 +1528,6 @@ static void run_client_loop(ConnectionContext *ctx) {
                     } else {
                         log_message(LOG_INFO, "NS", "Served INFO for '%s' to %s", file_snapshot.filename, ctx->username);
                     }
-
-                    if (metadata_updated) {
-                        ns_save_metadata(ns);
-                    }
                 }
             }
         } else if (strcmp(command, MSG_EXEC) == 0) {
@@ -1535,6 +1547,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                     ProtocolMessage content_msg;
                     int content_msg_valid = 0;
                     FILE *pipe = NULL;
+                    int metadata_dirty = 0;
 
                     do {
                         pthread_mutex_lock(&ns->state_lock);
@@ -1552,6 +1565,14 @@ static void run_client_loop(ConnectionContext *ctx) {
                             send_error_and_log(ctx->conn_fd, ERR_PERMISSION_DENIED, "User lacks read access for EXEC.", ctx->peer_ip, ctx->peer_port);
                             break;
                         }
+
+                        time_t now = get_current_time();
+                        file->last_access = now;
+                        if (safe_strcpy(file->last_access_user, ctx->username, sizeof(file->last_access_user)) != 0) {
+                            file->last_access_user[sizeof(file->last_access_user) - 1] = '\0';
+                        }
+                        file_snapshot = *file;
+                        metadata_dirty = 1;
 
                         if (safe_strcpy(resolved_filename, file_snapshot.filename, sizeof(resolved_filename)) != 0) {
                             pthread_mutex_unlock(&ns->state_lock);
@@ -1675,6 +1696,10 @@ static void run_client_loop(ConnectionContext *ctx) {
                     }
                     if (target_ss_acquired && target_ss) {
                         storage_server_release(target_ss);
+                    }
+
+                    if (metadata_dirty) {
+                        ns_save_metadata(ns);
                     }
                 }
             }
@@ -1982,7 +2007,9 @@ static void run_client_loop(ConnectionContext *ctx) {
                                 state_locked = 1;
                                 if (src_idx >= 0 && src_idx < ns->file_count) {
                                     FileMetadata *tracked = &ns->files[src_idx];
-                                    tracked->last_access = get_current_time();
+                                    time_t now = get_current_time();
+                                    tracked->last_access = now;
+                                    safe_strcpy(tracked->last_access_user, ctx->username, sizeof(tracked->last_access_user));
                                     persist_metadata = 1;
                                 }
                                 ns_release_state_lock(ns, &state_locked);
@@ -2070,6 +2097,8 @@ static void run_client_loop(ConnectionContext *ctx) {
                             file->created = now;
                             file->modified = now;
                             file->last_access = now;
+                            safe_strcpy(file->last_access_user, ctx->username, sizeof(file->last_access_user));
+                            safe_strcpy(file->last_modified_user, ctx->username, sizeof(file->last_modified_user));
                             file->size = 0;
                             file->read_access_count = 0;
                             file->write_access_count = 0;
@@ -2267,6 +2296,8 @@ static void run_client_loop(ConnectionContext *ctx) {
                         meta->created = now;
                         meta->modified = now;
                         meta->last_access = now;
+                        safe_strcpy(meta->last_access_user, ctx->username, sizeof(meta->last_access_user));
+                        safe_strcpy(meta->last_modified_user, ctx->username, sizeof(meta->last_modified_user));
 
                         if (file_index_insert(ns, path, new_index) != 0) {
                             memset(meta, 0, sizeof(FileMetadata));
@@ -2685,6 +2716,8 @@ static void run_client_loop(ConnectionContext *ctx) {
                                     file_cache_rename(ns, entry->old_path, entry->new_path, meta_index);
                                     meta->modified = now;
                                     meta->last_access = now;
+                                    safe_strcpy(meta->last_modified_user, ctx->username, sizeof(meta->last_modified_user));
+                                    safe_strcpy(meta->last_access_user, ctx->username, sizeof(meta->last_access_user));
                                 }
 
                                 pthread_mutex_unlock(&ns->state_lock);
@@ -2998,6 +3031,7 @@ static void run_client_loop(ConnectionContext *ctx) {
                 int have_access = 0;
                 int file_exists = 0;
                 int operation_known = 1;
+                int persist_metadata = 0;
 
                 pthread_mutex_lock(&ns->state_lock);
                 int file_index = -1;
@@ -3024,10 +3058,33 @@ static void run_client_loop(ConnectionContext *ctx) {
                     }
 
                     if (operation_known && have_access) {
+                        time_t now = get_current_time();
+                        int modifies = 0;
+
+                        if (safe_strcpy(file->last_access_user, ctx->username, sizeof(file->last_access_user)) != 0) {
+                            file->last_access_user[sizeof(file->last_access_user) - 1] = '\0';
+                        }
+                        file->last_access = now;
+
+                        if (strcasecmp(operation, "WRITE") == 0 ||
+                            strcasecmp(operation, "UNDO") == 0 ||
+                            strcasecmp(operation, "CHECKPOINT") == 0 ||
+                            strcasecmp(operation, "REVERT") == 0) {
+                            modifies = 1;
+                        }
+
+                        if (modifies) {
+                            if (safe_strcpy(file->last_modified_user, ctx->username, sizeof(file->last_modified_user)) != 0) {
+                                file->last_modified_user[sizeof(file->last_modified_user) - 1] = '\0';
+                            }
+                            file->modified = now;
+                        }
+
                         file_snapshot = *file;
                         if (file_index >= 0) {
                             file_cache_store(ns, filename, file_index);
                         }
+                        persist_metadata = 1;
                     }
                 }
                 pthread_mutex_unlock(&ns->state_lock);
@@ -3048,6 +3105,10 @@ static void run_client_loop(ConnectionContext *ctx) {
                         free(resp);
                     } else {
                         send_error_and_log(ctx->conn_fd, ERR_INTERNAL_ERROR, "Failed to build OK_LOC response.", ctx->peer_ip, ctx->peer_port);
+                    }
+
+                    if (persist_metadata) {
+                        ns_save_metadata(ns);
                     }
                 }
             }
