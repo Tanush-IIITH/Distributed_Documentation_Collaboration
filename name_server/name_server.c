@@ -1075,6 +1075,11 @@ static int file_add_access(FileMetadata *file, const char *username, int grant_r
         return -1;
     }
 
+    // If write is granted, implicitly grant read as well in metadata
+    if (grant_write) {
+        grant_read = 1;
+    }
+
     if (grant_read) {
         if (file_acl_add(file->read_access_users, &file->read_access_count, username) != 0) {
             return -1;
