@@ -2206,11 +2206,14 @@ int client_start(Client *client) {
             printf("  READ <filename>\n");
             printf("  WRITE <filename> <sentence_index>\n");
             printf("  VIEW [-a] [-l] [-al]\n");
+            printf("  VIEWFOLDER <path>\n");
             printf("  INFO <filename>\n");
             printf("  STREAM <filename>\n");
             printf("  UNDO <filename>\n");
             printf("  EXEC <filename>\n");
             printf("  LIST\n");
+            printf("  CREATEFOLDER <path>\n");
+            printf("  MOVE <source> <destination>\n");
             printf("  ADDACCESS -R|-W <filename> <username>\n");
             printf("  REMACCESS <filename> <username>\n");
             printf("  REQUESTACCESS <filename> <R|W|RW>\n");
