@@ -1,3 +1,22 @@
+/**
+ * @file protocol.c
+ * @brief Implementation of the wire protocol layer.
+ *
+ * Provides message parsing, construction, socket I/O, and error helpers
+ * used by all three components of the Distributed Documentation system.
+ *
+ * Design decisions:
+ *   - Messages are received ONE BYTE AT A TIME via recv() so that we can
+ *     detect the '\n' terminator without over-reading into the next message.
+ *     This is simpler than a ring-buffer approach and acceptable for this
+ *     system's message sizes (<= MAX_MESSAGE_SIZE = 64 KB).
+ *   - All field strings stored in ProtocolMessage->fields[] are individually
+ *     heap-allocated (via strdup).  Callers must call protocol_free_message()
+ *     to avoid memory leaks.
+ *   - The error_messages array uses designated initializers (C99) to map
+ *     numeric error codes directly to human-readable strings.  Gaps in the
+ *     array (unused codes) are left as NULL and handled by the fallback.
+ */
 #include "protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,21 +30,27 @@
 // ERROR MESSAGES
 // ============================================================================
 
+/*
+ * Designated-initializer array: index == error code, value == message string.
+ * Codes not listed here (or gaps between listed codes) are NULL and fall
+ * back to "Unknown error." in protocol_get_error_message().
+ */
 static const char* error_messages[] = {
     [ERR_USERNAME_INVALID] = "Username invalid or already connected.",
-    [ERR_USER_NOT_FOUND] = "User not found.",
-    [ERR_INVALID_REQUEST] = "Invalid index or arguments.",
-    [ERR_PERMISSION_DENIED] = "Permission denied.",
-    [ERR_FILE_NOT_FOUND] = "File not found.",
-    [ERR_FILE_EXISTS] = "File already exists.",
-    [ERR_SENTENCE_LOCKED] = "Sentence is locked by another user.",
-    [ERR_INTERNAL_ERROR] = "Internal server error.",
-    [ERR_DISK_ERROR] = "Disk error.",
-    [ERR_NO_UNDO_HISTORY] = "No undo history available for this file.",
-    [ERR_DELETE_FAILED] = "Failed to delete file from disk.",
-    [ERR_EXEC_FAILED] = "Command execution failed on server.",
+    [ERR_USER_NOT_FOUND]   = "User not found.",
+    [ERR_INVALID_REQUEST]  = "Invalid index or arguments.",
+    [ERR_PERMISSION_DENIED]= "Permission denied.",
+    [ERR_FILE_NOT_FOUND]   = "File not found.",
+    [ERR_FILE_EXISTS]      = "File already exists.",
+    [ERR_SENTENCE_LOCKED]  = "Sentence is locked by another user.",
+    [ERR_INTERNAL_ERROR]   = "Internal server error.",
+    [ERR_DISK_ERROR]       = "Disk error.",
+    [ERR_NO_UNDO_HISTORY]  = "No undo history available for this file.",
+    [ERR_DELETE_FAILED]    = "Failed to delete file from disk.",
+    [ERR_EXEC_FAILED]      = "Command execution failed on server.",
 };
 
+/** Computed size of the error_messages array for bounds checking. */
 #define ERROR_MESSAGES_SIZE (sizeof(error_messages) / sizeof(error_messages[0]))
 
 // ============================================================================
@@ -49,18 +74,19 @@ int protocol_parse_message(const char *raw, ProtocolMessage *msg) {
         return -1;
     }
 
-    // Initialize message structure
+    /* Zero-initialize so field pointers are NULL until explicitly set,
+     * making partial-failure cleanup in protocol_free_message() safe. */
     memset(msg, 0, sizeof(ProtocolMessage));
     strncpy(msg->raw_message, raw, MAX_MESSAGE_SIZE - 1);
     msg->raw_message[MAX_MESSAGE_SIZE - 1] = '\0';
 
-    // Remove trailing newline if present
+    /* Strip the trailing '\n' terminator so it does not pollute field[N]. */
     size_t len = strlen(msg->raw_message);
     if (len > 0 && msg->raw_message[len - 1] == '\n') {
         msg->raw_message[len - 1] = '\0';
     }
 
-    // Create a working copy for tokenization
+    /* We tokenize a working copy so raw_message stays intact for debugging. */
     char *work_copy = strdup(msg->raw_message);
     if (!work_copy) {
         return -1;
@@ -70,24 +96,28 @@ int protocol_parse_message(const char *raw, ProtocolMessage *msg) {
     char *current = work_copy;
     msg->field_count = 0;
 
+    /* Walk through the string, replacing each '|' with '\0' and duplicating
+     * each token into its own heap buffer. */
     while (current && msg->field_count < MAX_FIELDS) {
         char *next_delimiter = strstr(current, PROTOCOL_DELIMITER);
         if (next_delimiter) {
-            *next_delimiter = '\0';
+            *next_delimiter = '\0'; /* terminate current field */
         }
 
         msg->fields[msg->field_count] = strdup(current);
         if (!msg->fields[msg->field_count]) {
             free(work_copy);
-            protocol_free_message(msg);
+            protocol_free_message(msg); /* release any already-allocated fields */
             return -1;
         }
         msg->field_count++;
 
         if (!next_delimiter) {
-            break;
+            break; /* no more delimiters; this was the last field */
         }
         current = next_delimiter + delimiter_len;
+
+        /* If the message ends with '|', record one final empty field. */
         if (*current == '\0') {
             if (msg->field_count < MAX_FIELDS) {
                 msg->fields[msg->field_count] = strdup("");
@@ -111,7 +141,8 @@ char* protocol_build_message(const char **fields, int field_count) {
         return NULL;
     }
 
-    // Calculate total size needed
+    /* --- Pass 1: compute exact buffer size needed ---
+     * Sum field lengths + (field_count-1) delimiters + terminator + '\0'. */
     size_t total_size = 0;
     for (int i = 0; i < field_count; i++) {
         if (!fields[i]) {
@@ -122,15 +153,14 @@ char* protocol_build_message(const char **fields, int field_count) {
             total_size += strlen(PROTOCOL_DELIMITER);
         }
     }
-    total_size += strlen(PROTOCOL_TERMINATOR) + 1; // +1 for null terminator
+    total_size += strlen(PROTOCOL_TERMINATOR) + 1; /* +1 for null terminator */
 
-    // Allocate buffer
+    /* --- Pass 2: assemble the message into the allocated buffer --- */
     char *message = (char *)malloc(total_size);
     if (!message) {
         return NULL;
     }
 
-    // Build message
     message[0] = '\0';
     for (int i = 0; i < field_count; i++) {
         strcat(message, fields[i]);
@@ -219,25 +249,27 @@ char* protocol_receive_message(int sockfd) {
     size_t received = 0;
     int found_terminator = 0;
 
+    /* Read one byte at a time so we stop precisely at '\n' without
+     * consuming bytes that belong to the next message. */
     while (received < MAX_MESSAGE_SIZE - 1) {
         ssize_t n = recv(sockfd, buffer + received, 1, 0);
-        
+
         if (n < 0) {
             if (errno == EINTR) {
-                continue; // Interrupted, retry
+                continue; /* Interrupted by a signal; retry the recv. */
             }
             free(buffer);
-            return NULL; // Error
+            return NULL; /* Hard socket error */
         } else if (n == 0) {
-            // Connection closed
+            /* Peer closed the connection gracefully. */
             if (received == 0) {
                 free(buffer);
-                return NULL;
+                return NULL; /* EOF with no data — treat as error */
             }
-            break;
+            break; /* Partial message before close; return what we have. */
         }
 
-        // Check if we received the terminator
+        /* Check if we received the terminator */
         if (buffer[received] == '\n') {
             found_terminator = 1;
             received++;
@@ -249,8 +281,8 @@ char* protocol_receive_message(int sockfd) {
 
     buffer[received] = '\0';
 
+    /* Reject messages that hit the size limit without a terminator. */
     if (!found_terminator && received == MAX_MESSAGE_SIZE - 1) {
-        // Message too long
         free(buffer);
         return NULL;
     }

@@ -1,3 +1,20 @@
+/**
+ * @file utils.c
+ * @brief Implementation of the shared utility library.
+ *
+ * This file provides the concrete implementations for all helpers declared
+ * in utils.h. It is compiled into every component (NS, SS, Client) via the
+ * Makefile and therefore must remain free of component-specific logic.
+ *
+ * Key implementation notes:
+ *   - Several functions (get_timestamp, format_time, path_basename,
+ *     path_dirname, format_address) use static local buffers and are
+ *     therefore NOT thread-safe. Callers must copy the result if they
+ *     need to preserve it across another call or across threads.
+ *   - Logging is serialized by file I/O buffering; concurrent log_message()
+ *     calls from multiple threads may produce interleaved output lines.
+ *   - Base64 uses a standard RFC 4648 alphabet with '=' padding.
+ */
 #include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,8 +33,11 @@
 // GLOBAL VARIABLES
 // ============================================================================
 
+/** File pointer for the open log file; NULL means file logging is disabled. */
 static FILE *log_file_ptr = NULL;
+/** Active log filter: messages below this level are silently dropped. */
 static LogLevel current_log_level = LOG_INFO;
+/** When 1, log entries are also printed to stdout. Disable for daemon mode. */
 static int console_logging_enabled = 1;
 
 // ============================================================================
@@ -26,7 +46,9 @@ static int console_logging_enabled = 1;
 
 int log_init(const char *log_file, LogLevel level) {
     current_log_level = level;
-    
+
+    /* Open the log file in append mode so prior entries are not lost
+     * across server restarts. */
     if (log_file) {
         log_file_ptr = fopen(log_file, "a");
         if (!log_file_ptr) {
@@ -34,7 +56,7 @@ int log_init(const char *log_file, LogLevel level) {
             return -1;
         }
     }
-    
+
     return 0;
 }
 
@@ -43,19 +65,24 @@ void log_set_console(int enable) {
 }
 
 void log_message(LogLevel level, const char *component, const char *format, ...) {
+    /* Drop messages below the configured threshold to reduce noise. */
     if (level < current_log_level) {
         return;
     }
-    
+
+    /* Human-readable labels indexed by the LogLevel enum value. */
     const char *level_str[] = {"DEBUG", "INFO", "WARNING", "ERROR"};
     char *timestamp = get_timestamp();
 
+    /* Format the variadic message into a local buffer before writing. */
     char buffer[4096];
     va_list args;
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
 
+    /* fflush() after each entry so logs remain readable even if the
+     * process crashes without a clean shutdown. */
     if (console_logging_enabled) {
         fprintf(stdout, "[%s] [%s] [%s] %s\n", timestamp, level_str[level], component, buffer);
         fflush(stdout);
@@ -112,6 +139,7 @@ void log_cleanup(void) {
 // ============================================================================
 
 char* get_timestamp(void) {
+    /* WARNING: returns a pointer to a static buffer — not thread-safe. */
     static char buffer[64];
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
@@ -120,6 +148,7 @@ char* get_timestamp(void) {
 }
 
 char* format_time(time_t time) {
+    /* WARNING: shares the same static-buffer caveat as get_timestamp(). */
     static char buffer[64];
     struct tm *tm_info = localtime(&time);
     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
@@ -136,16 +165,20 @@ time_t get_current_time(void) {
 
 void trim_string(char *str) {
     if (!str) return;
-    
-    // Trim leading whitespace
+
+    /* --- Trim leading whitespace ---
+     * Advance `start` past all leading spaces, then shift the content
+     * to the beginning of the buffer using memmove (handles overlap). */
     char *start = str;
     while (isspace((unsigned char)*start)) start++;
-    
+
     if (start != str) {
         memmove(str, start, strlen(start) + 1);
     }
-    
-    // Trim trailing whitespace
+
+    /* --- Trim trailing whitespace ---
+     * Walk backwards from the last character and place the null terminator
+     * just after the last non-space character. */
     char *end = str + strlen(str) - 1;
     while (end > str && isspace((unsigned char)*end)) end--;
     *(end + 1) = '\0';
@@ -226,18 +259,22 @@ time_t get_file_atime(const char *path) {
 
 int create_directory_recursive(const char *path) {
     if (!path) return -1;
-    
+
     char tmp[MAX_PATH_LENGTH];
     char *p = NULL;
     size_t len;
-    
+
     snprintf(tmp, sizeof(tmp), "%s", path);
     len = strlen(tmp);
-    
+
+    /* Strip a trailing slash so the final mkdir below handles the leaf. */
     if (tmp[len - 1] == '/') {
         tmp[len - 1] = 0;
     }
-    
+
+    /* Walk the path byte-by-byte, temporarily null-terminating at each '/'
+     * to create intermediate components one level at a time.
+     * EEXIST is ignored because the directory may already exist. */
     for (p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
@@ -247,11 +284,12 @@ int create_directory_recursive(const char *path) {
             *p = '/';
         }
     }
-    
+
+    /* Create the leaf directory. */
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
         return -1;
     }
-    
+
     return 0;
 }
 
@@ -452,14 +490,19 @@ int flatten_logical_path(const char *logical, char *physical, size_t size) {
         return -1;
     }
 
+    /* Replace every '/' with '_' so that a logical path like
+     * "docs/report.txt" becomes the flat filename "docs_report.txt".
+     * Storage Servers store all files in a single directory to avoid
+     * subdirectory management complexity on disk. */
     size_t out_idx = 0;
     for (const char *p = logical; *p; ++p) {
         unsigned char ch = (unsigned char)*p;
 
-        if (ch == '/' ) {
+        if (ch == '/') {
             ch = '_';
         }
 
+        /* Guard against buffer overflow; clear and return error. */
         if (out_idx + 1 >= size) {
             physical[0] = '\0';
             return -1;
@@ -517,21 +560,21 @@ void safe_free(void *ptr) {
 
 int count_words(const char *text) {
     if (!text) return 0;
-    
+
     int count = 0;
-    int in_word = 0;
-    
+    int in_word = 0; /* 1 while scanning a non-whitespace token */
+
     for (const char *p = text; *p; p++) {
         if (isspace(*p)) {
-            in_word = 0;
+            in_word = 0; /* exiting a word */
         } else {
             if (!in_word) {
-                count++;
+                count++;   /* leading edge of a new word */
                 in_word = 1;
             }
         }
     }
-    
+
     return count;
 }
 
@@ -584,28 +627,24 @@ int parse_double(const char *text, double *out_value) {
     return 0;
 }
 
+/* Standard RFC 4648 Base64 alphabet: A-Z (0-25), a-z (26-51), 0-9 (52-61),
+ * '+' (62), '/' (63).  '=' is used as the padding character and handled
+ * specially in the encode/decode functions below. */
 static const char BASE64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/**
+ * @brief Return the 6-bit integer value of a Base64 character.
+ *
+ * @return 0-63 for valid alphabet characters, -2 for '=' (padding), -1 for invalid.
+ */
 static int base64_value(unsigned char c) {
-    if (c >= 'A' && c <= 'Z') {
-        return c - 'A';
-    }
-    if (c >= 'a' && c <= 'z') {
-        return c - 'a' + 26;
-    }
-    if (c >= '0' && c <= '9') {
-        return c - '0' + 52;
-    }
-    if (c == '+') {
-        return 62;
-    }
-    if (c == '/') {
-        return 63;
-    }
-    if (c == '=') {
-        return -2; // padding
-    }
-    return -1;
+    if (c >= 'A' && c <= 'Z') { return c - 'A';        } /* 0-25  */
+    if (c >= 'a' && c <= 'z') { return c - 'a' + 26;   } /* 26-51 */
+    if (c >= '0' && c <= '9') { return c - '0' + 52;   } /* 52-61 */
+    if (c == '+')             { return 62;               }
+    if (c == '/')             { return 63;               }
+    if (c == '=')             { return -2; /* padding */ }
+    return -1; /* invalid character */
 }
 
 int base64_encode(const unsigned char *input, size_t input_length, char **output) {
@@ -613,6 +652,8 @@ int base64_encode(const unsigned char *input, size_t input_length, char **output
         return -1;
     }
 
+    /* Every 3 input bytes become 4 Base64 characters.
+     * Integer ceiling division: (n + 2) / 3 * 4. */
     size_t output_length = 4 * ((input_length + 2) / 3);
     char *encoded = (char *)malloc(output_length + 1);
     if (!encoded) {
@@ -621,18 +662,21 @@ int base64_encode(const unsigned char *input, size_t input_length, char **output
 
     size_t j = 0;
     for (size_t i = 0; i < input_length; ) {
+        /* Consume up to 3 bytes; use 0x00 padding for the last incomplete group. */
         uint32_t octet_a = i < input_length ? input[i++] : 0;
         uint32_t octet_b = i < input_length ? input[i++] : 0;
         uint32_t octet_c = i < input_length ? input[i++] : 0;
 
+        /* Pack 3 bytes into a 24-bit integer, then extract four 6-bit sextets. */
         uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
 
         encoded[j++] = BASE64_TABLE[(triple >> 18) & 0x3F];
         encoded[j++] = BASE64_TABLE[(triple >> 12) & 0x3F];
-        encoded[j++] = BASE64_TABLE[(triple >> 6) & 0x3F];
-        encoded[j++] = BASE64_TABLE[triple & 0x3F];
+        encoded[j++] = BASE64_TABLE[(triple >> 6)  & 0x3F];
+        encoded[j++] = BASE64_TABLE[triple          & 0x3F];
     }
 
+    /* Overwrite the trailing 1 or 2 output characters with '=' padding. */
     size_t mod = input_length % 3;
     if (mod > 0) {
         encoded[output_length - 1] = '=';
@@ -725,18 +769,19 @@ int count_sentences(const char *text) {
 
 char* extract_sentence(const char *text, int sentence_index) {
     if (!text || sentence_index < 0) return NULL;
-    
+
     int current_sentence = 0;
     const char *start = text;
     const char *end = text;
-    
-    // Skip leading whitespace
+
+    /* Skip any leading whitespace before the first sentence. */
     while (*start && isspace(*start)) start++;
-    
+
+    /* Edge case: empty string with index 0 returns an empty sentence. */
     if (sentence_index == 0 && *start == '\0') {
         return strdup("");
     }
-    
+
     end = start;
     
     while (*end) {

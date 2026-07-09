@@ -1,3 +1,32 @@
+/**
+ * @file client.c
+ * @brief Implementation of the Client component.
+ *
+ * ARCHITECTURE:
+ *   The client runs a single-threaded interactive loop reading commands from
+ *   stdin.  Commands are dispatched by client_process_command() to individual
+ *   static handler functions.
+ *
+ * TWO COMMUNICATION CHANNELS:
+ *   1. NS channel (persistent): client->ns_sockfd, kept open for the session.
+ *      Used for all metadata/ACL commands and REQ_LOC queries.
+ *   2. SS channel (transient): opened per operation for READ/WRITE/STREAM/UNDO.
+ *      The client_connect_to_storage() helper creates a fresh TCP connection
+ *      to the SS address returned by REQ_LOC, uses it, and closes it.
+ *
+ * WRITE PROTOCOL (three-phase):
+ *   Phase 1 - Lock:    Send REQ_WRITE_LOCK|username|filename|sentence_index
+ *                      Await OK_LOCKED response from SS.
+ *   Phase 2 - Edits:   For each "word_index content" line from stdin, send
+ *                      WRITE_DATA|word_index|content to SS.
+ *   Phase 3 - Commit:  Send ETIRW ("WRITE" backwards) to SS.
+ *                      Await OK_WRITE_DONE confirming the commit.
+ *
+ * ERROR STRATEGY:
+ *   Each handler prints a human-readable error to stdout on failure and
+ *   returns -1. The main loop in client_start() ignores command-level errors
+ *   and continues accepting the next command.
+ */
 #include "client.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +38,10 @@
 #include <arpa/inet.h>
 #include <errno.h>
 
+/* ---------------------------------------------------------------------------
+ * Forward declarations for all static handler functions.
+ * Each handler corresponds to one user-visible command.
+ * --------------------------------------------------------------------------- */
 static int client_handle_view(Client *client, const char *flags);
 static int client_handle_list(Client *client);
 static int client_handle_addaccess(Client *client, const char *perm_flag, const char *filename, const char *username);
@@ -33,14 +66,25 @@ static int client_handle_rejectaccess(Client *client, int request_id);
 static int client_handle_createfolder(Client *client, const char *path);
 static int client_handle_viewfolder(Client *client, const char *path);
 static int client_handle_move(Client *client, const char *source, const char *destination);
+/* Helper: ask NS for the SS address of a file, used before direct SS ops. */
 static int client_request_location(Client *client, const char *operation, const char *filename,
                                    char *out_ip, size_t ip_len, int *out_port,
                                    char *out_filename, size_t filename_len);
+/* Helper: open a new TCP connection to a Storage Server. */
 static int client_connect_to_storage(const char *ip, int port);
+/* Helpers: receive streamed content lines or word tokens from the SS. */
 static int client_receive_read_stream(int ss_fd, const char *display_name);
 static int client_receive_word_stream(int ss_fd, const char *display_name);
+/* Helper: receive and parse one protocol message from a SS socket. */
 static int client_receive_ss_message(int fd, ProtocolMessage *out_msg, char **out_raw);
 
+/**
+ * @brief Initialize a Client struct with connection parameters.
+ *
+ * Validates the username against the alphanumeric-underscore policy,
+ * copies the NS IP/port, and sets ns_sockfd = -1 (not yet connected).
+ * Does NOT open a socket; call client_connect_to_ns() next.
+ */
 int client_init(Client *client, const char *username, const char *ns_ip, int ns_port) {
     if (!client || !username || !ns_ip) {
         return -1;
@@ -151,6 +195,14 @@ int client_connect_to_ns(Client *client) {
 }
 
 
+/**
+ * @brief Command dispatcher: parse the first token of stdin input and call
+ *        the appropriate static handler.
+ *
+ * Uses strcasecmp() so commands are case-insensitive ("read" == "READ").
+ * Returns -1 for unknown commands or argument parsing failures;
+ * the caller (client_start) simply continues to the next command.
+ */
 int client_process_command(Client *client, const char *input) {
     if (!client || !input) {
         return -1;
@@ -356,10 +408,15 @@ int client_process_command(Client *client, const char *input) {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Command handlers that talk to the Name Server directly
-// ---------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------
+ * Internal helpers used by command handlers.
+ * --------------------------------------------------------------------------- */
 
+/**
+ * @brief Send a pre-built protocol message on the NS socket and free it.
+ *
+ * Owns and frees the message buffer regardless of send success/failure.
+ */
 static int client_send_message(Client *client, char *message) {
     if (!client || client->ns_sockfd < 0 || !message) {
         return -1;
@@ -369,6 +426,12 @@ static int client_send_message(Client *client, char *message) {
     return rc;
 }
 
+/**
+ * @brief Receive and parse one protocol message from the NS socket.
+ *
+ * On success, *out_raw points to the heap-allocated raw string and
+ * *out_msg contains the parsed fields. The caller must free both.
+ */
 static int client_read_response(Client *client, ProtocolMessage *out_msg, char **out_raw) {
     if (!client || client->ns_sockfd < 0 || !out_msg || !out_raw) {
         return -1;
@@ -406,6 +469,13 @@ static int client_receive_ss_message(int fd, ProtocolMessage *out_msg, char **ou
     return 0;
 }
 
+/**
+ * @brief Print the NS response to stdout in a human-readable format.
+ *
+ * Errors are shown as "Error: <message>".
+ * Two-field OK responses print fields[1].
+ * Single-field responses print "OK".
+ */
 static void client_print_ns_response(const ProtocolMessage *msg) {
     if (!msg) {
         return;
@@ -419,6 +489,10 @@ static void client_print_ns_response(const ProtocolMessage *msg) {
         printf("OK\n");
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * VIEW command: list accessible files, optionally with metadata columns.
+ * --------------------------------------------------------------------------- */
 
 // Streams filenames the user can access via VIEW.
 static int client_handle_view(Client *client, const char *flags) {

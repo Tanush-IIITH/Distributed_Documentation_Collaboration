@@ -1,3 +1,42 @@
+/**
+ * @file storage_server.c
+ * @brief Implementation of the Storage Server (SS).
+ *
+ * STARTUP SEQUENCE:
+ *   1. ss_init()            - store NS/client addresses, compute storage_path.
+ *   2. ss_register_with_ns() - open TCP connection to NS, send HELLO_SS,
+ *                             await OK acknowledgement.
+ *   3. ss_load_existing_files() - scan storage_path, load each data file's
+ *                             sidecar .meta into a FileRecord, build the
+ *                             in-memory files linked list.
+ *   4. ss_send_file_list()  - enumerate all FileRecords, send SS_HAS_FILE
+ *                             for each one, then SS_FILES_DONE.
+ *   5. ss_start()           - launch the NS control thread, then enter the
+ *                             client accept loop.
+ *
+ * TWO LISTENER THREADS:
+ *   ns_control_loop()    - runs on ns_thread; receives NS sub-commands
+ *                          (CREATE_FILE, DELETE_FILE, GET_STATS, SS_ADDACCESS,
+ *                          SS_RENAME, SS_COPY, …) and sends synchronous replies.
+ *   client_thread()      - one thread per client connection; handles
+ *                          REQ_READ, REQ_STREAM, REQ_WRITE_LOCK/WRITE_DATA/
+ *                          ETIRW, REQ_UNDO, REQ_CHECKPOINT, REQ_REVERT, …
+ *
+ * SENTENCE-LEVEL WRITE LOCKING:
+ *   When a client sends REQ_WRITE_LOCK, the SS:
+ *     1. Checks that no other session holds a lock on the same sentence.
+ *     2. Creates a WriteSession capturing the sentence boundaries and a
+ *        full-file snapshot (for UNDO).
+ *     3. Returns OK_LOCKED to the client.
+ *   Subsequent WRITE_DATA messages from the same client update the
+ *   in-session working copy of the sentence.
+ *   ETIRW commits the working copy back into the file, saves the snapshot
+ *   as the .undo file, and destroys the WriteSession.
+ *
+ * METADATA FORMAT (per-file .meta sidecar):
+ *   Key=value lines, one per line.  Keys: LOGICAL, OWNER, CREATED, MODIFIED,
+ *   LAST_ACCESS, LAST_USER, UNDO, READ, WRITE, CHECKPOINT.
+ */
 #include "storage_server.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,15 +93,17 @@ static void handle_client_revert(StorageServer *ss, int fd, ProtocolMessage *msg
 static void handle_client_listcheckpoints(StorageServer *ss, int fd, ProtocolMessage *msg);
 static void handle_ss_copy(StorageServer *ss, ProtocolMessage *msg);
 
+/** Thread argument for the NS control loop thread. */
 typedef struct {
     StorageServer *ss;
 } NsThreadArgs;
 
+/** Thread argument for per-client connection threads. */
 typedef struct {
     StorageServer *ss;
-    int client_fd;
-    char client_ip[INET_ADDRSTRLEN];
-    int client_port;
+    int client_fd;                    /**< Accepted client socket. */
+    char client_ip[INET_ADDRSTRLEN];  /**< Client IP address for logging. */
+    int client_port;                  /**< Client port for logging. */
 } ClientThreadArgs;
 
 static void ss_free_file_records(FileRecord *head) {
@@ -87,6 +128,16 @@ static int build_path(char *buffer, size_t size, const char *base, const char *f
     return 0;
 }
 
+/**
+ * @brief Compute a per-SS storage directory path from the client IP/port.
+ *
+ * Each SS instance stores files under a unique subdirectory of SS_STORAGE_PATH.
+ * The directory name is derived from the client-facing IP and port so that
+ * multiple SS instances on the same machine do not share storage.
+ * Non-alphanumeric characters in the IP (dots) are replaced with underscores.
+ *
+ * Example: ss_storage/server_127_0_0_1_9001/
+ */
 static int ss_build_storage_path(char *buffer, size_t size, const char *client_ip, int client_port) {
     if (!buffer || size == 0) {
         return -1;
@@ -264,6 +315,14 @@ static void ss_prune_oldest_checkpoint(FileRecord *rec) {
     rec->checkpoint_count--;
 }
 
+/**
+ * @brief Set all path fields of a FileRecord from its logical name.
+ *
+ * The logical name (e.g., "docs/report.txt") is stored as-is in rec->filename.
+ * flatten_logical_path() converts it to a flat physical name ("docs_report.txt")
+ * stored in rec->physical_name.  All three on-disk paths (content, meta, undo)
+ * are then built by appending the physical name (plus suffixes) to storage_path.
+ */
 static void ss_set_record_paths(StorageServer *ss, FileRecord *rec, const char *logical_name) {
     if (!ss || !rec || !logical_name) {
         return;
@@ -377,6 +436,13 @@ static int ss_load_metadata(StorageServer *ss, FileRecord *rec) {
     return 0;
 }
 
+/**
+ * @brief Persist all in-memory metadata fields of a FileRecord to its .meta sidecar.
+ *
+ * The .meta file uses a simple KEY=value line format that ss_load_metadata()
+ * can parse on restart.  Called after every mutation (write, ACL change, etc.).
+ * Returns 0 on success, -1 if the file cannot be opened for writing.
+ */
 static int ss_write_metadata(FileRecord *rec) {
     FILE *fp = fopen(rec->metapath, "w");
     if (!fp) {
@@ -444,6 +510,14 @@ static int ss_add_file_record(StorageServer *ss, const char *filename) {
     return 0;
 }
 
+/**
+ * @brief Scan the storage directory and load FileRecords for all existing files.
+ *
+ * Called once during SS startup (after registration with the NS).  For each
+ * regular file found (excluding .meta, .undo, and .ckpt_ sidecar files),
+ * ss_add_file_record() is called to create an in-memory FileRecord and load
+ * its associated .meta sidecar if it exists.
+ */
 static void ss_load_existing_files(StorageServer *ss) {
     DIR *dir = opendir(ss->storage_path);
     if (!dir) {
@@ -499,6 +573,13 @@ static void ss_touch_file_metadata(StorageServer *ss, FileRecord *rec, const cha
     ss_write_metadata(rec);
 }
 
+/**
+ * @brief After modifying a file, push updated stats (size, words, chars) to the NS.
+ *
+ * Sends a WRITE_COMPLETE message so the NS can update its cached metadata
+ * (word_count, char_count, size) for this file without having to re-fetch
+ * the content itself.  Called after every successful write commit.
+ */
 static void ss_sync_metadata_to_ns(StorageServer *ss, FileRecord *rec) {
     if (!ss || !rec || ss->ns_sockfd < 0) {
         return;
@@ -776,6 +857,14 @@ static int ss_emit_file_list(StorageServer *ss) {
     return 0;
 }
 
+/**
+ * @brief NS control loop: runs on a dedicated thread receiving NS sub-commands.
+ *
+ * Loops calling protocol_receive_message() on ns_sockfd.  Each message is
+ * dispatched to the appropriate handler based on the command token (fields[0]).
+ * If the NS connection drops (receive returns NULL), running is set to 0 and
+ * the client listener is shut down to trigger a clean process exit.
+ */
 static void *ns_control_loop(void *arg) {
     NsThreadArgs *params = (NsThreadArgs *)arg;
     StorageServer *ss = params->ss;

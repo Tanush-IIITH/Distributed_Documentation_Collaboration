@@ -1,3 +1,33 @@
+/**
+ * @file name_server.c
+ * @brief Implementation of the Name Server (NS).
+ *
+ * STARTUP SEQUENCE:
+ *   1. ns_init()  - zero-initialise state, load persisted metadata from
+ *                   ns_metadata.db, create state_lock mutex.
+ *   2. ns_start() - bind a TCP listener, then enter an accept() loop.
+ *                   Each accepted connection spawns a new pthread.
+ *
+ * PER-CONNECTION THREAD:
+ *   The first message on any connection determines its type:
+ *     HELLO_CLIENT -> registered as a ClientInfo; serves client commands.
+ *     HELLO_SS     -> registered as a StorageServerInfo; receives SS_FILES_DONE
+ *                     then runs a dedicated response-relay loop for that SS.
+ *
+ * FILE LOOKUP FAST PATH (under state_lock):
+ *   file_cache_lookup()  O(FILE_CACHE_SIZE) linear scan - checked first.
+ *   file_index_find()    O(1) amortised hashmap lookup - fallback.
+ *   file_cache_store()   Updates cache on miss for future hits.
+ *
+ * STORAGE SERVER COMMAND PROTOCOL:
+ *   NS threads use storage_server_send_and_wait() to send a command to an
+ *   SS and block on response_cond.  The SS reader thread (ss_response_relay)
+ *   receives the SS's reply and signals response_cond to wake the waiter.
+ *
+ * PERSISTENCE:
+ *   ns_save_metadata() serialises all FileMetadata entries to ns_metadata.db
+ *   (called after every mutation).  ns_load_metadata() re-reads it at boot.
+ */
 #include "name_server.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +41,7 @@
 #include <limits.h>
 #include <strings.h>
 
+/** Path to the flat-file database used to persist NS metadata across restarts. */
 #define NS_DB_PATH "ns_metadata.db"
 
 static void ns_save_metadata(NameServer *ns);
@@ -57,18 +88,26 @@ int ns_init(NameServer *ns, int port) {
     return 0;
 }
 
+/**
+ * @brief Per-connection context passed to each pthread.
+ *
+ * Created on the heap in the accept loop and freed by the thread function
+ * when the connection is closed.  The is_client / is_storage_server flags
+ * determine which code path handles the connection after the initial
+ * HELLO handshake.
+ */
 typedef struct {
     NameServer *ns;
-    int conn_fd; //connection file descriptor
-    char peer_ip[INET_ADDRSTRLEN]; //peer ip address
-    int peer_port; //peer port number
-    int is_client;
-    int is_storage_server;
-    char username[MAX_USERNAME_LENGTH];
-    StorageServerInfo *ss_info;
+    int conn_fd;                         /**< Accepted client/SS socket. */
+    char peer_ip[INET_ADDRSTRLEN];       /**< Remote IP for logging. */
+    int peer_port;                       /**< Remote port for logging. */
+    int is_client;                       /**< 1 if the connection was identified as a Client. */
+    int is_storage_server;               /**< 1 if the connection was identified as a Storage Server. */
+    char username[MAX_USERNAME_LENGTH];  /**< Set after successful HELLO_CLIENT handshake. */
+    StorageServerInfo *ss_info;          /**< Set after successful HELLO_SS handshake. */
 } ConnectionContext;
 
-//close connection and free context
+/** Close the connection socket and free the heap-allocated context. */
 static void close_connection(ConnectionContext *ctx) {
     if (!ctx) {
         return;
@@ -79,7 +118,11 @@ static void close_connection(ConnectionContext *ctx) {
     free(ctx);
 }
 
-//send error message and log it
+/**
+ * @brief Build and send an ERR protocol message, then log the event.
+ *
+ * Centralises error formatting so every caller uses the same log format.
+ */
 static void send_error_and_log(int fd, int code, const char *message, const char *peer_ip, int peer_port) {
     char *err_resp = protocol_build_error(code, message);
     if (err_resp) {
@@ -520,12 +563,13 @@ static int storage_server_send_and_wait(StorageServerInfo *ss, const char **fiel
 }
 
 /*
-    Explanation of Hash implementation
-    The hash function takes a string (filename) as input and produces a fixed-size integer (hash value) as output. 
-    This hash value is used to determine the index in the hash table (file index) where the corresponding file metadata will be stored. 
-    The goal of the hash function is to distribute the file entries uniformly across the hash table to minimize collisions and ensure efficient lookups.
-    In case of collisions (two filenames producing the same hash value), a linked list is used to store multiple entries in the same bucket.
-*/
+ * DJB2 hash (variant): iteratively multiplies the running hash by 33 (via
+ * the left-shift + add) and XORs in each character byte.  Starting value
+ * 5381 is chosen empirically for good distribution over short strings.
+ *
+ * The hash is used modulo FILE_INDEX_SIZE to select a bucket, with
+ * chaining (linked list) handling collisions.
+ */
 
 //hash function for filenames (djb2 variant keeps distribution stable across runs)
 static unsigned long hash_filename(const char *str) {
